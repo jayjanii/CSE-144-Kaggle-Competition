@@ -7,6 +7,7 @@ from torch.utils.data import Dataset, DataLoader
 import timm
 
 from config import DEVICE, DATA_DIR, CKPT, MODEL_NAME, NUM_CLASSES
+from data import download_data
 from model import create_model
 
 
@@ -41,6 +42,8 @@ def parse_args():
 
 def main():
     args = parse_args()
+
+    download_data(args.data_dir)
 
     model = create_model(pretrained=False)
     state = torch.load(args.ckpt, map_location=DEVICE)
