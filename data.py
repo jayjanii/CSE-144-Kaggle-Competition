@@ -27,11 +27,21 @@ def get_transforms(model):
     return train_transform, val_transform
 
 
+def _numeric_folder_dataset(root, transform):
+    """ImageFolder with class folders sorted numerically instead of alphabetically."""
+    ds = datasets.ImageFolder(root, transform=transform)
+    # remap: class name (folder name as string) → int, sorted numerically
+    ds.class_to_idx = {cls: int(cls) for cls in ds.classes}
+    ds.targets = [ds.class_to_idx[ds.classes[t]] for t in ds.targets]
+    ds.samples = [(path, ds.class_to_idx[ds.classes[old_idx]]) for path, old_idx in ds.samples]
+    return ds
+
+
 def get_dataloaders(model, data_dir: str):
     train_transform, val_transform = get_transforms(model)
 
-    train_base = datasets.ImageFolder(os.path.join(data_dir, "train"), transform=train_transform)
-    val_base   = datasets.ImageFolder(os.path.join(data_dir, "train"), transform=val_transform)
+    train_base = _numeric_folder_dataset(os.path.join(data_dir, "train"), transform=train_transform)
+    val_base   = _numeric_folder_dataset(os.path.join(data_dir, "train"), transform=val_transform)
 
     n = len(train_base)
     train_size = int(0.8 * n)

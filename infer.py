@@ -17,7 +17,9 @@ class TestDataset(Dataset):
         self.transform = transform
         # sort numerically so output order matches sample_submission
         self.filenames = sorted(
-            [f for f in os.listdir(test_dir) if f.lower().endswith((".jpg", ".jpeg", ".png"))],
+            [f for f in os.listdir(test_dir)
+             if f.lower().endswith((".jpg", ".jpeg", ".png"))
+             and int(os.path.splitext(f)[0]) < 1000],
             key=lambda f: int(os.path.splitext(f)[0])
         )
 
