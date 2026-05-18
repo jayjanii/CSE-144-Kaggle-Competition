@@ -37,7 +37,21 @@ def _numeric_folder_dataset(root, transform):
     return ds
 
 
+_PHASE_CONFIG = {
+    1: (BATCH_SIZE_PHASE1, NUM_WORKERS_PHASE1),
+    2: (BATCH_SIZE_PHASE2, NUM_WORKERS_PHASE2),
+    3: (BATCH_SIZE_PHASE3, NUM_WORKERS_PHASE3),
+}
+
+
 def get_dataloaders(model, data_dir: str):
+    """Return a make_loaders(phase) callable.
+
+    The train/val split (randperm indices) is fixed once here so it stays
+    consistent across phases.  Call make_loaders(phase) just before each
+    phase and del the returned loaders afterward to avoid keeping multiple
+    worker pools alive simultaneously.
+    """
     train_transform, val_transform = get_transforms(model)
 
     train_base = _numeric_folder_dataset(os.path.join(data_dir, "train"), transform=train_transform)
@@ -50,29 +64,16 @@ def get_dataloaders(model, data_dir: str):
     train_dataset = Subset(train_base, indices[:train_size])
     val_dataset   = Subset(val_base,   indices[train_size:])
 
-    train_loader = DataLoader(
-        train_dataset, batch_size=BATCH_SIZE_PHASE1, shuffle=True,
-        num_workers=NUM_WORKERS_PHASE1, pin_memory=True,
-    )
-    val_loader = DataLoader(
-        val_dataset, batch_size=BATCH_SIZE_PHASE1, shuffle=False,
-        num_workers=NUM_WORKERS_PHASE1, pin_memory=True,
-    )
-    train_loader_phase2 = DataLoader(
-        train_dataset, batch_size=BATCH_SIZE_PHASE2, shuffle=True,
-        num_workers=NUM_WORKERS_PHASE2, pin_memory=True,
-    )
-    val_loader_phase2 = DataLoader(
-        val_dataset, batch_size=BATCH_SIZE_PHASE2, shuffle=False,
-        num_workers=NUM_WORKERS_PHASE2, pin_memory=True,
-    )
-    train_loader_phase3 = DataLoader(
-        train_dataset, batch_size=BATCH_SIZE_PHASE3, shuffle=True,
-        num_workers=NUM_WORKERS_PHASE3, pin_memory=True,
-    )
-    val_loader_phase3 = DataLoader(
-        val_dataset, batch_size=BATCH_SIZE_PHASE3, shuffle=False,
-        num_workers=NUM_WORKERS_PHASE3, pin_memory=True,
-    )
+    def make_loaders(phase: int):
+        batch_size, num_workers = _PHASE_CONFIG[phase]
+        train_loader = DataLoader(
+            train_dataset, batch_size=batch_size, shuffle=True,
+            num_workers=num_workers, pin_memory=True, persistent_workers=num_workers > 0,
+        )
+        val_loader = DataLoader(
+            val_dataset, batch_size=batch_size, shuffle=False,
+            num_workers=num_workers, pin_memory=True, persistent_workers=num_workers > 0,
+        )
+        return train_loader, val_loader
 
-    return train_loader, val_loader, train_loader_phase2, val_loader_phase2, train_loader_phase3, val_loader_phase3
+    return make_loaders

@@ -2,6 +2,34 @@ import torch
 from torch.cuda.amp import autocast, GradScaler
 
 
+class EarlyStopper:
+    """Signals when a phase should stop due to val_acc plateauing.
+
+    Tracks the best seen value and increments a patience counter each epoch
+    that fails to improve by at least min_delta.  Call it after each
+    validation step; it returns True when training should stop.
+
+    Args:
+        patience:  epochs without improvement before stopping.
+        min_delta: minimum improvement over the current best to reset the
+                   counter.  Filters out noise from near-flat regions.
+    """
+
+    def __init__(self, patience: int, min_delta: float = 1e-4):
+        self.patience = patience
+        self.min_delta = min_delta
+        self.best = -float("inf")
+        self.counter = 0
+
+    def __call__(self, val_acc: float) -> bool:
+        if val_acc > self.best + self.min_delta:
+            self.best = val_acc
+            self.counter = 0
+        else:
+            self.counter += 1
+        return self.counter >= self.patience
+
+
 def train_one_epoch(model, dataloader, criterion, optimizer, device):
     model.train()
     running_loss = 0.0
