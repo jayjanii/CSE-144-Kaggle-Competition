@@ -24,7 +24,7 @@ WEIGHT_DECAY = 0.01
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 # Paths — override via environment variables for Colab / different setups
-DATA_DIR = os.environ.get("DATA_DIR", "data")
+DATA_DIR = os.environ.get("DATA_DIR", "/content/data")
 CKPT = os.environ.get("CKPT_PATH", "best.pth")
 
 # WandB
