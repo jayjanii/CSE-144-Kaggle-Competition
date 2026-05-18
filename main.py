@@ -1,0 +1,160 @@
+import argparse
+import os
+import torch
+import torch.nn as nn
+from torch.cuda.amp import GradScaler
+import wandb
+
+from config import (
+    DEVICE, CKPT, DATA_DIR,
+    EPOCHS_PHASE1, EPOCHS_PHASE2,
+    BATCH_SIZE_PHASE1, BATCH_SIZE_PHASE2, ACCUM_STEPS,
+    LR_HEAD_PHASE1, LR_HEAD_PHASE2, LR_BACKBONE_PHASE2,
+    WEIGHT_DECAY, MODEL_NAME,
+    WANDB_PROJECT, WANDB_ENTITY,
+)
+from data import download_data, get_dataloaders
+from model import create_model, freeze_backbone, unfreeze_all
+from train import train_one_epoch, train_one_epoch_phase2
+from evaluate import evaluate
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(description="EVA-02 fine-tuning on CIFAR-100")
+    parser.add_argument(
+        "--skip-phase1", action="store_true",
+        help="Skip head-only training (phase 1) and go straight to full fine-tuning.",
+    )
+    parser.add_argument(
+        "--resume", type=str, default=None, metavar="CKPT",
+        help="Path to a checkpoint (.pth) to load before training. "
+             "Use with --skip-phase1 to resume from a saved phase-1 checkpoint.",
+    )
+    parser.add_argument(
+        "--data-dir", type=str, default=DATA_DIR,
+        help="Directory containing the competition data (default: DATA_DIR env / 'data').",
+    )
+    parser.add_argument(
+        "--ckpt", type=str, default=CKPT,
+        help="Where to save the best checkpoint (default: CKPT_PATH env / 'best.pth').",
+    )
+    return parser.parse_args()
+
+
+def main():
+    args = parse_args()
+
+    # Kaggle token must be in the environment so kagglehub can authenticate.
+    # Set KAGGLE_API_TOKEN in your shell / Colab secrets before running.
+    if not os.environ.get("KAGGLE_API_TOKEN"):
+        print("Warning: KAGGLE_API_TOKEN not set — data download will fail if data is missing.")
+
+    download_data(args.data_dir)
+
+    model = create_model(pretrained=True)
+
+    if args.resume:
+        state = torch.load(args.resume, map_location=DEVICE)
+        model.load_state_dict(state)
+        print(f"Loaded checkpoint from {args.resume}")
+
+    train_loader, val_loader, train_loader_phase2, val_loader_phase2 = get_dataloaders(model, args.data_dir)
+
+    criterion = nn.CrossEntropyLoss()
+
+    run = wandb.init(
+        project=WANDB_PROJECT,
+        entity=WANDB_ENTITY,
+        config={
+            "epochs_phase1": EPOCHS_PHASE1,
+            "epochs_phase2": EPOCHS_PHASE2,
+            "batch_size_phase1": BATCH_SIZE_PHASE1,
+            "batch_size_phase2": BATCH_SIZE_PHASE2,
+            "effective_batch_size": BATCH_SIZE_PHASE2 * ACCUM_STEPS,
+            "accum_steps": ACCUM_STEPS,
+            "lr_head_phase1": LR_HEAD_PHASE1,
+            "lr_head_phase2": LR_HEAD_PHASE2,
+            "lr_backbone_phase2": LR_BACKBONE_PHASE2,
+            "model": MODEL_NAME,
+            "skip_phase1": args.skip_phase1,
+            "resume": args.resume,
+        },
+    )
+
+    best_val_acc = 0.0
+
+    # ------------------------------------------------------------------
+    # Phase 1: head-only training
+    # ------------------------------------------------------------------
+    if not args.skip_phase1:
+        print("Phase 1: Training head only...")
+        freeze_backbone(model)
+
+        optimizer = torch.optim.AdamW(
+            model.head.parameters(), lr=LR_HEAD_PHASE1, weight_decay=WEIGHT_DECAY
+        )
+
+        for epoch in range(EPOCHS_PHASE1):
+            train_loss, train_acc = train_one_epoch(model, train_loader, criterion, optimizer, DEVICE)
+            val_loss, val_acc = evaluate(model, val_loader, criterion, DEVICE)
+
+            run.log({"train/loss": train_loss, "train/acc": train_acc,
+                     "val/loss": val_loss, "val/acc": val_acc,
+                     "epoch": epoch, "phase": 1})
+
+            if val_acc > best_val_acc:
+                best_val_acc = val_acc
+                torch.save(model.state_dict(), args.ckpt)
+                run.save(args.ckpt)
+
+            print(f"[P1] Epoch {epoch:02d} | train_loss={train_loss:.4f} | val_acc={val_acc:.4f}")
+    else:
+        print("Skipping phase 1.")
+        # Track whatever the loaded checkpoint achieves so phase 2 still saves improvements.
+        _, best_val_acc = evaluate(model, val_loader, criterion, DEVICE)
+        print(f"Loaded checkpoint val_acc={best_val_acc:.4f}")
+
+    # ------------------------------------------------------------------
+    # Phase 2: full fine-tune with AMP + gradient accumulation
+    # ------------------------------------------------------------------
+    print("Phase 2: Finetuning full model...")
+    unfreeze_all(model)
+    model.set_grad_checkpointing(True)
+
+    optimizer = torch.optim.AdamW(
+        [
+            {"params": model.head.parameters(), "lr": LR_HEAD_PHASE2},
+            {"params": [p for name, p in model.named_parameters() if "head" not in name],
+             "lr": LR_BACKBONE_PHASE2},
+        ],
+        weight_decay=WEIGHT_DECAY,
+    )
+
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS_PHASE2)
+    scaler = GradScaler()
+
+    for epoch in range(EPOCHS_PHASE2):
+        train_loss, train_acc = train_one_epoch_phase2(
+            model, train_loader_phase2, criterion, optimizer, DEVICE, ACCUM_STEPS, scaler
+        )
+        val_loss, val_acc = evaluate(model, val_loader_phase2, criterion, DEVICE)
+        scheduler.step()
+
+        phase1_offset = 0 if args.skip_phase1 else EPOCHS_PHASE1
+        run.log({"train/loss": train_loss, "train/acc": train_acc,
+                 "val/loss": val_loss, "val/acc": val_acc,
+                 "epoch": phase1_offset + epoch, "phase": 2})
+
+        if val_acc > best_val_acc:
+            best_val_acc = val_acc
+            torch.save(model.state_dict(), args.ckpt)
+            run.save(args.ckpt)
+
+        print(f"[P2] Epoch {epoch:02d} | train_loss={train_loss:.4f} | train_acc={train_acc:.4f} | val_acc={val_acc:.4f}")
+
+    run.finish()
+    print(f"Done. Best val_acc={best_val_acc:.4f}. Checkpoint saved to {args.ckpt}")
+
+
+if __name__ == "__main__":
+    main()
