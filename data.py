@@ -6,8 +6,8 @@ from torchvision import datasets
 from torch.utils.data import DataLoader, Subset
 
 from config import (
-    BATCH_SIZE_PHASE1, BATCH_SIZE_PHASE2,
-    NUM_WORKERS_PHASE1, NUM_WORKERS_PHASE2,
+    BATCH_SIZE_PHASE1, BATCH_SIZE_PHASE2, BATCH_SIZE_PHASE3,
+    NUM_WORKERS_PHASE1, NUM_WORKERS_PHASE2, NUM_WORKERS_PHASE3,
     KAGGLE_COMPETITION,
 )
 
@@ -66,5 +66,13 @@ def get_dataloaders(model, data_dir: str):
         val_dataset, batch_size=BATCH_SIZE_PHASE2, shuffle=False,
         num_workers=NUM_WORKERS_PHASE2, pin_memory=True,
     )
+    train_loader_phase3 = DataLoader(
+        train_dataset, batch_size=BATCH_SIZE_PHASE3, shuffle=True,
+        num_workers=NUM_WORKERS_PHASE3, pin_memory=True,
+    )
+    val_loader_phase3 = DataLoader(
+        val_dataset, batch_size=BATCH_SIZE_PHASE3, shuffle=False,
+        num_workers=NUM_WORKERS_PHASE3, pin_memory=True,
+    )
 
-    return train_loader, val_loader, train_loader_phase2, val_loader_phase2
+    return train_loader, val_loader, train_loader_phase2, val_loader_phase2, train_loader_phase3, val_loader_phase3

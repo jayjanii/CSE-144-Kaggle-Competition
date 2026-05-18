@@ -1,7 +1,11 @@
 import timm
 import torch
 
-from config import MODEL_NAME, NUM_CLASSES, DEVICE
+from config import (
+    MODEL_NAME, NUM_CLASSES, DEVICE,
+    LR_HEAD_PHASE2, LR_BACKBONE_PHASE2,
+    LR_HEAD_PHASE3, LR_BLOCKS_TOP_PHASE3, LR_BLOCKS_REST_PHASE3,
+)
 
 
 def create_model(pretrained: bool = True) -> torch.nn.Module:
@@ -17,7 +21,29 @@ def freeze_backbone(model: torch.nn.Module) -> None:
     for param in model.head.parameters():
         param.requires_grad = True
 
+def unfreeze_top_blocks(model: torch.nn.Module):
+    """Phase 2: unfreeze last 4 blocks + head with differential LRs"""
+    for param in model.parameters():
+        param.requires_grad = False
 
-def unfreeze_all(model: torch.nn.Module) -> None:
+    for param in model.head.parameters():
+        param.requires_grad = True
+    for param in model.blocks[-4:].parameters():
+        param.requires_grad = True
+
+    return [
+        {"params": model.head.parameters(),        "lr": LR_HEAD_PHASE2},
+        {"params": model.blocks[-4:].parameters(), "lr": LR_BACKBONE_PHASE2},
+    ]
+
+
+def unfreeze_all(model: torch.nn.Module):
+    """Phase 3: full model with differential LRs"""
     for param in model.parameters():
         param.requires_grad = True
+
+    return [
+        {"params": model.head.parameters(),         "lr": LR_HEAD_PHASE3},
+        {"params": model.blocks[-4:].parameters(),  "lr": LR_BLOCKS_TOP_PHASE3},
+        {"params": model.blocks[:-4].parameters(),  "lr": LR_BLOCKS_REST_PHASE3},
+    ]
