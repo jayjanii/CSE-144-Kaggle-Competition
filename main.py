@@ -2,7 +2,6 @@ import argparse
 import os
 import torch
 import torch.nn as nn
-from torch.cuda.amp import GradScaler
 import wandb
 
 from config import (
@@ -143,7 +142,7 @@ def main():
     param_groups = unfreeze_top_blocks(model)
     optimizer = torch.optim.AdamW(param_groups, weight_decay=WEIGHT_DECAY)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS_PHASE2)
-    scaler = GradScaler()
+    scaler = torch.amp.GradScaler(DEVICE)
     stopper = EarlyStopper(patience=PATIENCE_PHASE2)
 
     train_loader, val_loader = make_loaders(2)
@@ -180,7 +179,7 @@ def main():
     param_groups = unfreeze_all(model)
     optimizer = torch.optim.AdamW(param_groups, weight_decay=WEIGHT_DECAY)
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPOCHS_PHASE3)
-    scaler = GradScaler()
+    scaler = torch.amp.GradScaler(DEVICE)
     stopper = EarlyStopper(patience=PATIENCE_PHASE3)
 
     train_loader, val_loader = make_loaders(3)

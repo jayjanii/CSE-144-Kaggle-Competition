@@ -1,5 +1,4 @@
 import torch
-from torch.cuda.amp import autocast, GradScaler
 
 
 class EarlyStopper:
@@ -53,7 +52,7 @@ def train_one_epoch(model, dataloader, criterion, optimizer, device):
     return running_loss / total, correct / total
 
 
-def train_one_epoch_phase2(model, loader, criterion, optimizer, device, accum_steps, scaler: GradScaler):
+def train_one_epoch_phase2(model, loader, criterion, optimizer, device, accum_steps, scaler: torch.amp.GradScaler):
     model.train()
     optimizer.zero_grad()
 
@@ -62,7 +61,7 @@ def train_one_epoch_phase2(model, loader, criterion, optimizer, device, accum_st
     for i, (images, labels) in enumerate(loader):
         images, labels = images.to(device), labels.to(device)
 
-        with autocast():
+        with torch.amp.autocast(device):
             outputs = model(images)
             loss = criterion(outputs, labels) / accum_steps
 
