@@ -199,9 +199,9 @@ def _cutmix(x: torch.Tensor, y: torch.Tensor, alpha: float):
 
 
 def apply_mix(x, y, cfg, use_mix: bool):
-    """Returns (input, ya, yb, lam). ya==yb==None means no mixing was applied."""
+    """Returns (input, ya, yb, lam). ya is None means no mixing was applied."""
     if not use_mix or random.random() > cfg["mixup_cutmix_prob"]:
-        return x, y, None, None
+        return x, None, None, None
     if random.random() < 0.5:
         mixed, ya, yb, lam = _mixup(x, y, cfg["mixup_alpha"])
     else:
@@ -458,7 +458,18 @@ def train_phase3(model, loader, criterion, optimizer, scaler, cfg) -> tuple[floa
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 
+def parse_args():
+    import argparse
+    p = argparse.ArgumentParser()
+    p.add_argument("--skip-phase1", action="store_true",
+                   help="Skip phase 1 and start from phase 2 using existing best.pth")
+    p.add_argument("--skip-phase2", action="store_true",
+                   help="Skip phases 1+2 and start from phase 3 using existing best.pth")
+    return p.parse_args()
+
+
 def main():
+    args = parse_args()
     cfg = CONFIG
     out = Path(cfg["output_dir"])
     out.mkdir(parents=True, exist_ok=True)
@@ -482,98 +493,108 @@ def main():
     best_val_acc = 0.0
 
     # ── Phase 1: Head Warmup ──────────────────────────────────────────────────
-    print("\n=== Phase 1: Head Warmup (frozen backbone) ===")
-    for p in model.parameters():
-        p.requires_grad = False
-    for p in model.head.parameters():
-        p.requires_grad = True
+    if args.skip_phase1 or args.skip_phase2:
+        print(f"Skipping phase 1 — loading {best_ckpt}")
+        _, best_val_acc = load_ckpt(best_ckpt, model)
+    else:
+        print("\n=== Phase 1: Head Warmup (frozen backbone) ===")
+        for p in model.parameters():
+            p.requires_grad = False
+        for p in model.head.parameters():
+            p.requires_grad = True
 
-    train_loader, val_loader = make_loaders(train_ds, val_ds, cfg["batch_size"])
+        train_loader, val_loader = make_loaders(train_ds, val_ds, cfg["batch_size"])
 
-    criterion1 = LabelSmoothingCE(cfg["label_smoothing"])
-    optimizer1 = torch.optim.AdamW(
-        get_param_groups(model.head.named_parameters(), cfg["phase1_lr"], cfg["weight_decay"]),
-        betas=(0.9, 0.999),
-    )
-    scheduler1 = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer1, T_max=cfg["phase1_epochs"], eta_min=cfg["eta_min"]
-    )
-
-    for epoch in range(cfg["phase1_epochs"]):
-        t0 = time.time()
-        train_loss, train_acc = train_phase1(model, train_loader, criterion1, optimizer1)
-        val_loss, val_top1, val_top5 = evaluate(model, val_loader, criterion1)
-        scheduler1.step()
-
-        lr_h = optimizer1.param_groups[0]["lr"]
-        if val_top1 > best_val_acc:
-            best_val_acc = val_top1
-            save_ckpt(best_ckpt, model, optimizer1, scheduler1, epoch, best_val_acc, 1)
-        save_ckpt(latest_ckpt, model, optimizer1, scheduler1, epoch, best_val_acc, 1)
-
-        append_csv(log_path, 1, epoch, train_loss, val_loss, val_top1, val_top5, lr_h, lr_h)
-        print(
-            f"[P1 E{epoch:02d}] loss={train_loss:.4f} | acc={train_acc:.4f} | "
-            f"val_top1={val_top1:.4f} | val_top5={val_top5:.4f} | "
-            f"lr={lr_h:.2e} | {time.time()-t0:.0f}s"
+        criterion1 = LabelSmoothingCE(cfg["label_smoothing"])
+        optimizer1 = torch.optim.AdamW(
+            get_param_groups(model.head.named_parameters(), cfg["phase1_lr"], cfg["weight_decay"]),
+            betas=(0.9, 0.999),
         )
+        scheduler1 = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer1, T_max=cfg["phase1_epochs"], eta_min=cfg["eta_min"]
+        )
+
+        for epoch in range(cfg["phase1_epochs"]):
+            t0 = time.time()
+            train_loss, train_acc = train_phase1(model, train_loader, criterion1, optimizer1)
+            val_loss, val_top1, val_top5 = evaluate(model, val_loader, criterion1)
+            scheduler1.step()
+
+            lr_h = optimizer1.param_groups[0]["lr"]
+            if val_top1 > best_val_acc:
+                best_val_acc = val_top1
+                save_ckpt(best_ckpt, model, optimizer1, scheduler1, epoch, best_val_acc, 1)
+            save_ckpt(latest_ckpt, model, optimizer1, scheduler1, epoch, best_val_acc, 1)
+
+            append_csv(log_path, 1, epoch, train_loss, val_loss, val_top1, val_top5, lr_h, lr_h)
+            print(
+                f"[P1 E{epoch:02d}] loss={train_loss:.4f} | acc={train_acc:.4f} | "
+                f"val_top1={val_top1:.4f} | val_top5={val_top5:.4f} | "
+                f"lr={lr_h:.2e} | {time.time()-t0:.0f}s"
+            )
+
+        del train_loader, val_loader
 
     # ── Phase 2: Full Fine-tune with LLRD ─────────────────────────────────────
-    print("\n=== Phase 2: Full LLRD Fine-tune ===")
-    del train_loader, val_loader
     torch.cuda.empty_cache()
 
-    load_ckpt(best_ckpt, model)
-    for p in model.parameters():
-        p.requires_grad = True
-    enable_grad_checkpointing(model)
+    if args.skip_phase2:
+        print(f"Skipping phase 2 — loading {best_ckpt}")
+        _, best_val_acc = load_ckpt(best_ckpt, model)
+    else:
+        print("\n=== Phase 2: Full LLRD Fine-tune ===")
+        load_ckpt(best_ckpt, model)
+        for p in model.parameters():
+            p.requires_grad = True
+        enable_grad_checkpointing(model)
 
-    train_loader2, val_loader2 = make_loaders(train_ds, val_ds, cfg["phase23_batch_size"])
-    # optimizer steps per epoch = ceil(batches / accum_steps)
-    steps_per_epoch = math.ceil(len(train_loader2) / cfg["grad_accum_steps"])
+        train_loader2, val_loader2 = make_loaders(train_ds, val_ds, cfg["phase23_batch_size"])
+        steps_per_epoch = math.ceil(len(train_loader2) / cfg["grad_accum_steps"])
 
-    criterion2 = LabelSmoothingCE(cfg["label_smoothing"])
-    print("LLRD param groups:")
-    optimizer2 = build_llrd_optimizer(
-        model,
-        base_lr=cfg["phase2_base_lr"],
-        decay=cfg["llrd_decay"],
-        head_lr_scale=cfg["head_lr_scale"],
-        weight_decay=cfg["weight_decay"],
-    )
-
-    total_steps = cfg["phase2_epochs"] * steps_per_epoch
-    warmup_steps = cfg["warmup_epochs"] * steps_per_epoch
-    scheduler2 = get_cosine_schedule_with_warmup(
-        optimizer2,
-        num_warmup_steps=warmup_steps,
-        num_training_steps=total_steps,
-    )
-    scaler2 = torch.amp.GradScaler(DEVICE)
-
-    for epoch in range(cfg["phase2_epochs"]):
-        t0 = time.time()
-        train_loss, train_acc = train_phase2(
-            model, train_loader2, criterion2, optimizer2, scaler2, scheduler2, cfg
+        criterion2 = LabelSmoothingCE(cfg["label_smoothing"])
+        print("LLRD param groups:")
+        optimizer2 = build_llrd_optimizer(
+            model,
+            base_lr=cfg["phase2_base_lr"],
+            decay=cfg["llrd_decay"],
+            head_lr_scale=cfg["head_lr_scale"],
+            weight_decay=cfg["weight_decay"],
         )
-        val_loss, val_top1, val_top5 = evaluate(model, val_loader2, criterion2)
 
-        lr_h, lr_lb = _get_lrs(optimizer2)
-        if val_top1 > best_val_acc:
-            best_val_acc = val_top1
-            save_ckpt(best_ckpt, model, optimizer2, scheduler2, epoch, best_val_acc, 2)
-        save_ckpt(latest_ckpt, model, optimizer2, scheduler2, epoch, best_val_acc, 2)
-
-        append_csv(log_path, 2, epoch, train_loss, val_loss, val_top1, val_top5, lr_h, lr_lb)
-        print(
-            f"[P2 E{epoch:02d}] loss={train_loss:.4f} | acc={train_acc:.4f} | "
-            f"val_top1={val_top1:.4f} | val_top5={val_top5:.4f} | "
-            f"lr_h={lr_h:.2e} lr_lb={lr_lb:.2e} | {time.time()-t0:.0f}s"
+        total_steps = cfg["phase2_epochs"] * steps_per_epoch
+        warmup_steps = cfg["warmup_epochs"] * steps_per_epoch
+        scheduler2 = get_cosine_schedule_with_warmup(
+            optimizer2,
+            num_warmup_steps=warmup_steps,
+            num_training_steps=total_steps,
         )
+        scaler2 = torch.amp.GradScaler(DEVICE)
+
+        for epoch in range(cfg["phase2_epochs"]):
+            t0 = time.time()
+            train_loss, train_acc = train_phase2(
+                model, train_loader2, criterion2, optimizer2, scaler2, scheduler2, cfg
+            )
+            val_loss, val_top1, val_top5 = evaluate(model, val_loader2, criterion2)
+
+            lr_h, lr_lb = _get_lrs(optimizer2)
+            if val_top1 > best_val_acc:
+                best_val_acc = val_top1
+                save_ckpt(best_ckpt, model, optimizer2, scheduler2, epoch, best_val_acc, 2)
+            save_ckpt(latest_ckpt, model, optimizer2, scheduler2, epoch, best_val_acc, 2)
+
+            append_csv(log_path, 2, epoch, train_loss, val_loss, val_top1, val_top5, lr_h, lr_lb)
+            print(
+                f"[P2 E{epoch:02d}] loss={train_loss:.4f} | acc={train_acc:.4f} | "
+                f"val_top1={val_top1:.4f} | val_top5={val_top5:.4f} | "
+                f"lr_h={lr_h:.2e} lr_lb={lr_lb:.2e} | {time.time()-t0:.0f}s"
+            )
+
+        del train_loader2, val_loader2
 
     # ── Phase 3: Cosine Restart ───────────────────────────────────────────────
+    # ── Phase 3: Cosine Restart ───────────────────────────────────────────────
     print("\n=== Phase 3: Cosine Restart ===")
-    del train_loader2, val_loader2
     torch.cuda.empty_cache()
 
     load_ckpt(best_ckpt, model)
