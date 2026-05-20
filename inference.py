@@ -163,6 +163,9 @@ def main():
 
     # pseudo-labels for self-training (uses TTA-averaged probs → higher quality)
     if args.pseudo_labels_out:
+        parent = os.path.dirname(args.pseudo_labels_out)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
         kept = 0
         with open(args.pseudo_labels_out, "w", newline="") as f:
             w = csv.writer(f)
