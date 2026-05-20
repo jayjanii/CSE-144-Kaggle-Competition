@@ -4,8 +4,9 @@ import os
 import torch
 import torch.nn as nn
 import wandb
-from timm.data import Mixup
-from timm.loss import SoftTargetCrossEntropy
+
+torch.backends.cudnn.benchmark = True
+torch.set_float32_matmul_precision("high")
 
 from config import (
     ACCUM_STEPS,
@@ -14,24 +15,18 @@ from config import (
     BATCH_SIZE_PHASE2,
     BATCH_SIZE_PHASE3,
     CKPT,
-    CUTMIX_ALPHA,
     DATA_DIR,
     DEVICE,
     EPOCHS_PHASE1,
     EPOCHS_PHASE2,
     EPOCHS_PHASE3,
-    LABEL_SMOOTHING,
     LR_BACKBONE_PHASE2,
     LR_BLOCKS_REST_PHASE3,
     LR_BLOCKS_TOP_PHASE3,
     LR_HEAD_PHASE1,
     LR_HEAD_PHASE2,
     LR_HEAD_PHASE3,
-    MIXUP_ALPHA,
-    MIXUP_PROB,
-    MIXUP_SWITCH_PROB,
     MODEL_NAME,
-    NUM_CLASSES,
     PATIENCE_PHASE1,
     PATIENCE_PHASE2,
     PATIENCE_PHASE3,
@@ -43,9 +38,6 @@ from data import download_data, get_dataloaders
 from evaluate import evaluate
 from model import create_model, freeze_backbone, unfreeze_all, unfreeze_top_blocks
 from train import EarlyStopper, train_one_epoch, train_one_epoch_phase2
-
-torch.backends.cudnn.benchmark = True
-torch.set_float32_matmul_precision("high")
 
 
 def parse_args():
@@ -97,16 +89,7 @@ def main():
 
     make_loaders = get_dataloaders(model, args.data_dir)
 
-    mixup_fn = Mixup(
-        mixup_alpha=MIXUP_ALPHA,
-        cutmix_alpha=CUTMIX_ALPHA,
-        prob=MIXUP_PROB,
-        switch_prob=MIXUP_SWITCH_PROB,
-        label_smoothing=LABEL_SMOOTHING,
-        num_classes=NUM_CLASSES,
-    )
-    train_criterion = SoftTargetCrossEntropy()
-    val_criterion = nn.CrossEntropyLoss()
+    criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
 
     run = wandb.init(
         project=WANDB_PROJECT,
@@ -151,20 +134,13 @@ def main():
         optimizer = torch.optim.AdamW(
             model.head.parameters(), lr=LR_HEAD_PHASE1, weight_decay=WEIGHT_DECAY
         )
-        scaler = torch.amp.GradScaler(DEVICE)
         stopper = EarlyStopper(patience=PATIENCE_PHASE1)
 
         for epoch in range(EPOCHS_PHASE1):
             train_loss, train_acc = train_one_epoch(
-                model,
-                train_loader,
-                val_criterion,
-                optimizer,
-                DEVICE,
-                scaler,
-                mixup_fn=None,
+                model, train_loader, criterion, optimizer, DEVICE
             )
-            val_loss, val_acc = evaluate(model, val_loader, val_criterion, DEVICE)
+            val_loss, val_acc = evaluate(model, val_loader, criterion, DEVICE)
 
             run.log(
                 {
@@ -193,8 +169,7 @@ def main():
                 break
     else:
         print("Skipping phase 1.")
-        # Track whatever the loaded checkpoint achieves so phase 2 still saves improvements.
-        _, best_val_acc = evaluate(model, val_loader, val_criterion, DEVICE)
+        _, best_val_acc = evaluate(model, val_loader, criterion, DEVICE)
         print(f"Loaded checkpoint val_acc={best_val_acc:.4f}")
 
     del train_loader, val_loader
@@ -203,6 +178,7 @@ def main():
     # p2
     # ------------------------------------------------------------------
     print("Phase 2: top blocks + head...")
+    model.set_grad_checkpointing(True)
 
     param_groups = unfreeze_top_blocks(model)
     optimizer = torch.optim.AdamW(param_groups, weight_decay=WEIGHT_DECAY)
@@ -216,16 +192,9 @@ def main():
 
     for epoch in range(EPOCHS_PHASE2):
         train_loss, train_acc = train_one_epoch_phase2(
-            model,
-            train_loader,
-            train_criterion,
-            optimizer,
-            DEVICE,
-            ACCUM_STEPS,
-            scaler,
-            mixup_fn,
+            model, train_loader, criterion, optimizer, DEVICE, ACCUM_STEPS, scaler
         )
-        val_loss, val_acc = evaluate(model, val_loader, val_criterion, DEVICE)
+        val_loss, val_acc = evaluate(model, val_loader, criterion, DEVICE)
         scheduler.step()
 
         phase1_offset = 0 if args.skip_phase1 else EPOCHS_PHASE1
@@ -273,16 +242,9 @@ def main():
 
     for epoch in range(EPOCHS_PHASE3):
         train_loss, train_acc = train_one_epoch_phase2(
-            model,
-            train_loader,
-            train_criterion,
-            optimizer,
-            DEVICE,
-            ACCUM_STEPS_PHASE3,
-            scaler,
-            mixup_fn,
+            model, train_loader, criterion, optimizer, DEVICE, ACCUM_STEPS_PHASE3, scaler
         )
-        val_loss, val_acc = evaluate(model, val_loader, val_criterion, DEVICE)
+        val_loss, val_acc = evaluate(model, val_loader, criterion, DEVICE)
         scheduler.step()
 
         phase_offset = (0 if args.skip_phase1 else EPOCHS_PHASE1) + EPOCHS_PHASE2
