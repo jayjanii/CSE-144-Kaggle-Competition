@@ -96,7 +96,6 @@ def main():
         print(f"Loaded checkpoint from {args.resume}")
 
     make_loaders = get_dataloaders(model, args.data_dir)
-    model = torch.compile(model)
 
     mixup_fn = Mixup(
         mixup_alpha=MIXUP_ALPHA,
@@ -159,11 +158,11 @@ def main():
             train_loss, train_acc = train_one_epoch(
                 model,
                 train_loader,
-                train_criterion,
+                val_criterion,
                 optimizer,
                 DEVICE,
                 scaler,
-                mixup_fn,
+                mixup_fn=None,
             )
             val_loss, val_acc = evaluate(model, val_loader, val_criterion, DEVICE)
 
