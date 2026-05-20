@@ -2,7 +2,7 @@ import os
 import torch
 
 # model
-MODEL_NAME = "eva02_large_patch14_448"
+MODEL_NAME = "vit_giant_patch14_dinov2.lvd142m"
 NUM_CLASSES = 100
 
 # p1
@@ -20,6 +20,7 @@ ACCUM_STEPS = 8
 LR_HEAD_PHASE2 = 1e-4
 LR_BACKBONE_PHASE2 = 1e-5
 PATIENCE_PHASE2 = 5
+TOP_BLOCKS_PHASE2 = 6  # number of trailing blocks to unfreeze in phase 2
 
 # p3
 EPOCHS_PHASE3 = 10
