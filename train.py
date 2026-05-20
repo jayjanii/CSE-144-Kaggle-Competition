@@ -42,6 +42,7 @@ CONFIG = {
     "train_dir": "data/train",
     "test_dir": "data/test",
     "output_dir": "outputs/",
+    "kaggle_competition": "ucsc-cse-144-spring-2026-final-project",
 }
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -49,6 +50,21 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 DINOV2_MEAN = (0.485, 0.456, 0.406)
 DINOV2_STD = (0.229, 0.224, 0.225)
 NUM_BLOCKS = 40  # ViT-g/14 has 40 transformer blocks
+
+
+# ── Data download ─────────────────────────────────────────────────────────────
+
+def maybe_download_data(cfg: dict) -> None:
+    """Download competition data via kagglehub if train_dir is missing."""
+    if os.path.isdir(cfg["train_dir"]) and os.listdir(cfg["train_dir"]):
+        print(f"Data found at {cfg['train_dir']}, skipping download.")
+        return
+    import kagglehub
+    print(f"Downloading {cfg['kaggle_competition']} via kagglehub...")
+    path = kagglehub.competition_download(cfg["kaggle_competition"])
+    print(f"Downloaded to: {path}")
+    cfg["train_dir"] = os.path.join(path, "train")
+    cfg["test_dir"] = os.path.join(path, "test")
 
 
 # ── Model ─────────────────────────────────────────────────────────────────────
@@ -434,6 +450,8 @@ def main():
 
     torch.backends.cudnn.benchmark = True
     torch.set_float32_matmul_precision("high")
+
+    maybe_download_data(cfg)
 
     print("Building DINOv2-Giant model...")
     model = build_model(cfg["num_classes"])

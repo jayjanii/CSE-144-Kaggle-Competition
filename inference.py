@@ -99,13 +99,17 @@ def main():
     parser = argparse.ArgumentParser(description="TTA inference for DINOv2-Giant")
     parser.add_argument("--ckpt", default=os.path.join(cfg["output_dir"], "best.pth"),
                         help="Path to best checkpoint")
-    parser.add_argument("--test-dir", default=cfg["test_dir"])
+    parser.add_argument("--test-dir", default=None,
+                        help="Flat test image folder (default: cfg test_dir or kagglehub path)")
     parser.add_argument("--output-dir", default=cfg["output_dir"])
     args = parser.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
     sub_path = os.path.join(args.output_dir, "submission.csv")
     probs_path = os.path.join(args.output_dir, "submission_probs.csv")
+
+    from train import maybe_download_data
+    maybe_download_data(cfg)
 
     print("Loading model...")
     model = build_model(cfg["num_classes"])
@@ -115,7 +119,8 @@ def main():
     print(f"Loaded checkpoint from {args.ckpt} "
           f"(phase={ckpt.get('phase','?')}, best_val_acc={ckpt.get('best_val_acc',0):.4f})")
 
-    dataset = TestDataset(args.test_dir)
+    test_dir = args.test_dir or cfg["test_dir"]
+    dataset = TestDataset(test_dir)
     print(f"Running TTA ({cfg['tta_sizes']} × 5 crops × 2 flips = 30 passes) "
           f"on {len(dataset)} test images...")
 
