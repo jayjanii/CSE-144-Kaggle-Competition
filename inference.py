@@ -102,6 +102,12 @@ def main():
     parser.add_argument("--test-dir", default=None,
                         help="Flat test image folder (default: cfg test_dir or kagglehub path)")
     parser.add_argument("--output-dir", default=cfg["output_dir"])
+    parser.add_argument("--wandb", action="store_true",
+                        help="Log prediction distribution + confidence to Weights & Biases")
+    parser.add_argument("--pseudo-labels-out", default=None, metavar="CSV",
+                        help="Also write a pseudo_labels.csv of high-confidence test predictions")
+    parser.add_argument("--pseudo-threshold", type=float, default=0.95,
+                        help="Min TTA softmax confidence to keep a pseudo-label (default: 0.95)")
     args = parser.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
@@ -125,6 +131,7 @@ def main():
           f"on {len(dataset)} test images...")
 
     all_ids: list[str] = []
+    all_fnames: list[str] = []
     all_preds: list[int] = []
     all_probs: list[torch.Tensor] = []
 
@@ -132,6 +139,7 @@ def main():
         probs = run_tta(model, img, cfg)
         image_id = os.path.splitext(fname)[0]
         all_ids.append(image_id)
+        all_fnames.append(fname)
         all_preds.append(int(probs.argmax().item()))
         all_probs.append(probs)
         if (i + 1) % 100 == 0:
@@ -152,6 +160,44 @@ def main():
         for image_id, row in zip(all_ids, prob_matrix):
             w.writerow([image_id] + [f"{v:.6f}" for v in row.tolist()])
     print(f"Saved softmax probs  → {probs_path}")
+
+    # pseudo-labels for self-training (uses TTA-averaged probs → higher quality)
+    if args.pseudo_labels_out:
+        kept = 0
+        with open(args.pseudo_labels_out, "w", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(["filename", "label", "confidence"])
+            for fname, probs in zip(all_fnames, all_probs):
+                conf, lab = probs.max(dim=0)
+                if conf.item() >= args.pseudo_threshold:
+                    w.writerow([fname, int(lab.item()), f"{conf.item():.4f}"])
+                    kept += 1
+        print(f"Pseudo-labels: kept {kept}/{len(all_fnames)} "
+              f"(thr={args.pseudo_threshold}) → {args.pseudo_labels_out}")
+
+    if args.wandb:
+        try:
+            import wandb
+        except ImportError:
+            print("wandb not installed — skipping inference logging.")
+        else:
+            prob_t = torch.stack(all_probs)
+            top1_conf = prob_t.max(dim=1).values
+            run = wandb.init(
+                project=os.environ.get("WANDB_PROJECT", "cse144-final"),
+                entity=os.environ.get("WANDB_ENTITY", "jay_jani-university-of-california"),
+                job_type="inference",
+                config={"ckpt": args.ckpt, "tta_sizes": cfg["tta_sizes"],
+                        "n_test": len(dataset)},
+            )
+            run.summary["mean_top1_confidence"] = float(top1_conf.mean())
+            run.summary["frac_conf_below_0.5"] = float((top1_conf < 0.5).float().mean())
+            run.log({
+                "pred_class_hist": wandb.Histogram(all_preds),
+                "top1_conf_hist": wandb.Histogram(top1_conf.numpy()),
+            })
+            run.finish()
+            print("Logged inference summary to wandb.")
 
 
 if __name__ == "__main__":

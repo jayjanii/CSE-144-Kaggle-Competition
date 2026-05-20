@@ -13,7 +13,7 @@ import torch
 import torch.nn as nn
 from albumentations.pytorch import ToTensorV2
 from PIL import Image
-from torch.utils.data import DataLoader, Dataset, Subset
+from torch.utils.data import ConcatDataset, DataLoader, Dataset, Subset
 from torchvision import datasets
 from transformers import get_cosine_schedule_with_warmup
 
@@ -43,8 +43,12 @@ CONFIG = {
     "tta_sizes": [392, 448, 518],
     "train_dir": "data/train",
     "test_dir": "data/test",
-    "output_dir": "outputs/",
+    "output_dir": os.environ.get("OUTPUT_DIR", "outputs/"),
     "kaggle_competition": "ucsc-cse-144-spring-2026-final-project",
+    "seed": 42,
+    "wandb_project": os.environ.get("WANDB_PROJECT", "cse144-final"),
+    "wandb_entity": os.environ.get("WANDB_ENTITY", "jay_jani-university-of-california"),
+    "wandb_mode": os.environ.get("WANDB_MODE", "online"),
 }
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -52,6 +56,24 @@ DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 DINOV2_MEAN = (0.485, 0.456, 0.406)
 DINOV2_STD = (0.229, 0.224, 0.225)
 NUM_BLOCKS = 40  # ViT-g/14 has 40 transformer blocks
+
+
+# ── Reproducibility ───────────────────────────────────────────────────────────
+
+def set_seed(seed: int) -> None:
+    os.environ["PYTHONHASHSEED"] = str(seed)
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+
+def _worker_init_fn(worker_id: int) -> None:
+    seed = torch.initial_seed() % (2 ** 32)
+    np.random.seed(seed)
+    random.seed(seed)
 
 
 # ── Data download ─────────────────────────────────────────────────────────────
@@ -80,13 +102,17 @@ def build_model(num_classes: int = 100) -> nn.Module:
 
 
 def enable_grad_checkpointing(model: nn.Module) -> None:
-    """Wrap each transformer block's forward with torch.utils.checkpoint."""
+    """Wrap each transformer block's forward with torch.utils.checkpoint (idempotent)."""
     import torch.utils.checkpoint as cp
+    if getattr(model, "_grad_ckpt_enabled", False):
+        print("Gradient checkpointing already enabled — skipping.")
+        return
     for blk in model.blocks:
         orig = blk.forward
         def _cp(x, _f=orig):
             return cp.checkpoint(_f, x, use_reentrant=False)
         blk.forward = _cp
+    model._grad_ckpt_enabled = True
     print("Gradient checkpointing enabled.")
 
 
@@ -142,6 +168,23 @@ class AlbumentationsDataset(Dataset):
         return self.transform(image=img_np)["image"], label
 
 
+class PseudoLabelDataset(Dataset):
+    """High-confidence test images with model-generated pseudo-labels (PIL output)."""
+
+    def __init__(self, csv_path: str, test_dir: str):
+        self.test_dir = test_dir
+        with open(csv_path, newline="") as f:
+            self.samples = [(r["filename"], int(r["label"])) for r in csv.DictReader(f)]
+
+    def __len__(self) -> int:
+        return len(self.samples)
+
+    def __getitem__(self, idx):
+        fname, label = self.samples[idx]
+        img = Image.open(os.path.join(self.test_dir, fname)).convert("RGB")
+        return img, label
+
+
 def _numeric_image_folder(root: str) -> datasets.ImageFolder:
     """ImageFolder with class folder names mapped to their integer values."""
     ds = datasets.ImageFolder(root)  # no transform → PIL images
@@ -154,24 +197,50 @@ def _numeric_image_folder(root: str) -> datasets.ImageFolder:
     return ds
 
 
-def get_datasets(cfg: dict):
+def get_datasets(cfg: dict, full_train: bool = False, pseudo_csv: str | None = None):
+    """Build (train_ds, val_ds).
+
+    full_train: use 100%% of labeled data, no val split (val_ds is None).
+    pseudo_csv: append high-confidence pseudo-labeled test images to the train set.
+    """
     size = cfg["input_size"]
+    seed = cfg["seed"]
+    train_tf = get_train_transform(size)
     base_ds = _numeric_image_folder(cfg["train_dir"])
     n = len(base_ds)
-    indices = torch.randperm(n, generator=torch.Generator().manual_seed(42)).tolist()
-    train_idx = indices[: int(0.8 * n)]
-    val_idx = indices[int(0.8 * n) :]
-    train_ds = AlbumentationsDataset(Subset(base_ds, train_idx), get_train_transform(size))
-    val_ds = AlbumentationsDataset(Subset(base_ds, val_idx), get_val_transform(size))
+
+    if full_train:
+        train_core = AlbumentationsDataset(base_ds, train_tf)
+        val_ds = None
+        print(f"Full-train mode: using all {n} labeled images, no val split.")
+    else:
+        indices = torch.randperm(n, generator=torch.Generator().manual_seed(seed)).tolist()
+        train_idx = indices[: int(0.8 * n)]
+        val_idx = indices[int(0.8 * n) :]
+        train_core = AlbumentationsDataset(Subset(base_ds, train_idx), train_tf)
+        val_ds = AlbumentationsDataset(Subset(base_ds, val_idx), get_val_transform(size))
+
+    if pseudo_csv:
+        pseudo_base = PseudoLabelDataset(pseudo_csv, cfg["test_dir"])
+        pseudo_ds = AlbumentationsDataset(pseudo_base, train_tf)
+        train_ds = ConcatDataset([train_core, pseudo_ds])
+        print(f"Added {len(pseudo_base)} pseudo-labeled samples → train size {len(train_ds)}.")
+    else:
+        train_ds = train_core
+
     return train_ds, val_ds
 
 
-def make_loaders(train_ds, val_ds, batch_size: int):
-    kw = dict(num_workers=4, pin_memory=True, persistent_workers=True)
-    return (
-        DataLoader(train_ds, batch_size=batch_size, shuffle=True, **kw),
-        DataLoader(val_ds,   batch_size=batch_size, shuffle=False, **kw),
+def make_loaders(train_ds, val_ds, batch_size: int, seed: int = 42):
+    kw = dict(num_workers=4, pin_memory=True, persistent_workers=True,
+              worker_init_fn=_worker_init_fn,
+              generator=torch.Generator().manual_seed(seed))
+    train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True, **kw)
+    val_loader = (
+        DataLoader(val_ds, batch_size=batch_size, shuffle=False, **kw)
+        if val_ds is not None else None
     )
+    return train_loader, val_loader
 
 
 # ── MixUp / CutMix ───────────────────────────────────────────────────────────
@@ -337,20 +406,38 @@ def evaluate(model: nn.Module, loader: DataLoader, criterion: nn.Module):
     return total_loss / total, total_top1 / total, total_top5 / total
 
 
+def eval_and_track(model, val_loader, criterion, best_val_acc, full_train):
+    """Evaluate if a val loader exists; decide whether to checkpoint.
+
+    Returns (val_loss, val_top1, val_top5, do_save, best_val_acc).
+    In full-train mode there is no val set, so every epoch is saved and the
+    last epoch becomes the final model.
+    """
+    if val_loader is not None:
+        val_loss, val_top1, val_top5 = evaluate(model, val_loader, criterion)
+        do_save = val_top1 > best_val_acc
+        best_val_acc = max(best_val_acc, val_top1)
+        return val_loss, val_top1, val_top5, do_save, best_val_acc
+    nan = float("nan")
+    return nan, nan, nan, True, best_val_acc
+
+
 # ── Checkpointing ─────────────────────────────────────────────────────────────
 
-def save_ckpt(path: str, model, optimizer, scheduler, epoch: int, best_val_acc: float, phase: int):
-    torch.save(
-        {
-            "model": model.state_dict(),
-            "optimizer": optimizer.state_dict(),
-            "scheduler": scheduler.state_dict() if scheduler is not None else None,
-            "epoch": epoch,
-            "best_val_acc": best_val_acc,
-            "phase": phase,
-        },
-        path,
-    )
+def save_ckpt(path: str, model, optimizer, scheduler, epoch: int, best_val_acc: float,
+              phase: int, save_optim: bool = False):
+    """Save a checkpoint. Model-only by default (inference + phase-boundary loads
+    never read the optimizer state); pass save_optim=True for true resume support."""
+    ckpt = {
+        "model": model.state_dict(),
+        "epoch": epoch,
+        "best_val_acc": best_val_acc,
+        "phase": phase,
+    }
+    if save_optim:
+        ckpt["optimizer"] = optimizer.state_dict()
+        ckpt["scheduler"] = scheduler.state_dict() if scheduler is not None else None
+    torch.save(ckpt, path)
 
 
 def load_ckpt(path: str, model, optimizer=None, scheduler=None) -> tuple[int, float]:
@@ -381,6 +468,44 @@ def append_csv(path: str, phase, epoch, train_loss, val_loss, val_top1, val_top5
         )
 
 
+# ── Weights & Biases ──────────────────────────────────────────────────────────
+
+def init_wandb(cfg: dict, args):
+    """Return a wandb run, or None if disabled / unavailable."""
+    if getattr(args, "no_wandb", False):
+        print("wandb disabled (--no-wandb).")
+        return None
+    try:
+        import wandb
+    except ImportError:
+        print("wandb not installed — skipping experiment logging.")
+        return None
+    run = wandb.init(
+        project=cfg["wandb_project"],
+        entity=cfg["wandb_entity"],
+        mode=cfg["wandb_mode"],
+        config={k: v for k, v in cfg.items() if not k.startswith("wandb_")},
+    )
+    return run
+
+
+def wandb_log(run, phase, global_epoch, train_loss, train_acc,
+              val_loss, val_top1, val_top5, lr_h, lr_lb):
+    if run is None:
+        return
+    run.log({
+        "phase": phase,
+        "global_epoch": global_epoch,
+        "train/loss": train_loss,
+        "train/acc": train_acc,
+        "val/loss": val_loss,
+        "val/top1": val_top1,
+        "val/top5": val_top5,
+        "lr/head": lr_h,
+        "lr/last_block": lr_lb,
+    })
+
+
 # ── Training loops ────────────────────────────────────────────────────────────
 
 def train_phase1(model, loader, criterion, optimizer) -> tuple[float, float]:
@@ -407,7 +532,7 @@ def _train_amp(model, loader, criterion, optimizer, scaler, cfg,
     If scheduler is provided it is stepped per optimizer step (transformers-style).
     """
     model.train()
-    total_loss = total_correct = total = 0
+    total_loss = total_correct = total = clean_total = 0
     optimizer.zero_grad()
 
     for i, (x, y) in enumerate(loader):
@@ -430,7 +555,10 @@ def _train_amp(model, loader, criterion, optimizer, scaler, cfg,
             optimizer.zero_grad()
 
         total_loss += loss.item() * accum_steps * x.size(0)
-        total_correct += (logits.argmax(1) == y).sum().item()
+        # train_acc is only meaningful on un-mixed batches
+        if ya is None:
+            total_correct += (logits.argmax(1) == y).sum().item()
+            clean_total += x.size(0)
         total += x.size(0)
 
     # flush any leftover partial accumulation window
@@ -443,7 +571,7 @@ def _train_amp(model, loader, criterion, optimizer, scaler, cfg,
             scheduler.step()
         optimizer.zero_grad()
 
-    return total_loss / total, total_correct / total
+    return total_loss / total, total_correct / max(clean_total, 1)
 
 
 def train_phase2(model, loader, criterion, optimizer, scaler, scheduler, cfg) -> tuple[float, float]:
@@ -460,27 +588,70 @@ def train_phase3(model, loader, criterion, optimizer, scaler, cfg) -> tuple[floa
 
 def parse_args():
     import argparse
-    p = argparse.ArgumentParser()
+    p = argparse.ArgumentParser(description="DINOv2-Giant three-phase fine-tuning")
+    # phase control
     p.add_argument("--skip-phase1", action="store_true",
                    help="Skip phase 1 and start from phase 2 using existing best.pth")
     p.add_argument("--skip-phase2", action="store_true",
                    help="Skip phases 1+2 and start from phase 3 using existing best.pth")
+    # data / training mode
+    p.add_argument("--full-train", action="store_true",
+                   help="Train on 100%% of labeled data (no val split); keep the last epoch")
+    p.add_argument("--pseudo-labels", default=None, metavar="CSV",
+                   help="Path to pseudo_labels.csv (from inference.py) to append to training")
+    p.add_argument("--seed", type=int, default=CONFIG["seed"])
+    p.add_argument("--train-dir", default=CONFIG["train_dir"])
+    p.add_argument("--test-dir", default=CONFIG["test_dir"])
+    p.add_argument("--output-dir", default=CONFIG["output_dir"])
+    # hyperparameter overrides (handy for Colab sweeps)
+    p.add_argument("--phase1-epochs", type=int, default=CONFIG["phase1_epochs"])
+    p.add_argument("--phase2-epochs", type=int, default=CONFIG["phase2_epochs"])
+    p.add_argument("--phase3-epochs", type=int, default=CONFIG["phase3_epochs"])
+    p.add_argument("--batch-size", type=int, default=CONFIG["batch_size"])
+    p.add_argument("--phase23-batch-size", type=int, default=CONFIG["phase23_batch_size"])
+    p.add_argument("--grad-accum-steps", type=int, default=CONFIG["grad_accum_steps"])
+    # checkpointing
+    p.add_argument("--save-optimizer", action="store_true",
+                   help="Also store optimizer/scheduler state (larger ckpt; for future resume)")
+    # logging
+    p.add_argument("--no-wandb", action="store_true",
+                   help="Disable Weights & Biases logging")
     return p.parse_args()
 
 
 def main():
     args = parse_args()
-    cfg = CONFIG
+    cfg = dict(CONFIG)
+    cfg.update({
+        "seed": args.seed,
+        "train_dir": args.train_dir,
+        "test_dir": args.test_dir,
+        "output_dir": args.output_dir,
+        "phase1_epochs": args.phase1_epochs,
+        "phase2_epochs": args.phase2_epochs,
+        "phase3_epochs": args.phase3_epochs,
+        "batch_size": args.batch_size,
+        "phase23_batch_size": args.phase23_batch_size,
+        "grad_accum_steps": args.grad_accum_steps,
+        "full_train": args.full_train,
+        "pseudo_labels": args.pseudo_labels,
+    })
+    full_train = args.full_train
+    save_optimizer = args.save_optimizer
+
     out = Path(cfg["output_dir"])
     out.mkdir(parents=True, exist_ok=True)
 
     best_ckpt = str(out / "best.pth")
-    latest_ckpt = str(out / "latest.pth")
     log_path = str(out / "train_log.csv")
     init_csv(log_path)
+    print(f"Checkpoints → {best_ckpt}")
 
-    torch.backends.cudnn.benchmark = True
+    set_seed(cfg["seed"])
     torch.set_float32_matmul_precision("high")
+
+    run = init_wandb(cfg, args)
+    global_epoch = 0
 
     maybe_download_data(cfg)
 
@@ -488,7 +659,7 @@ def main():
     model = build_model(cfg["num_classes"])
 
     print("Preparing datasets...")
-    train_ds, val_ds = get_datasets(cfg)
+    train_ds, val_ds = get_datasets(cfg, full_train=full_train, pseudo_csv=args.pseudo_labels)
 
     best_val_acc = 0.0
 
@@ -503,7 +674,7 @@ def main():
         for p in model.head.parameters():
             p.requires_grad = True
 
-        train_loader, val_loader = make_loaders(train_ds, val_ds, cfg["batch_size"])
+        train_loader, val_loader = make_loaders(train_ds, val_ds, cfg["batch_size"], cfg["seed"])
 
         criterion1 = LabelSmoothingCE(cfg["label_smoothing"])
         optimizer1 = torch.optim.AdamW(
@@ -517,18 +688,21 @@ def main():
         for epoch in range(cfg["phase1_epochs"]):
             t0 = time.time()
             train_loss, train_acc = train_phase1(model, train_loader, criterion1, optimizer1)
-            val_loss, val_top1, val_top5 = evaluate(model, val_loader, criterion1)
+            val_loss, val_top1, val_top5, do_save, best_val_acc = eval_and_track(
+                model, val_loader, criterion1, best_val_acc, full_train)
             scheduler1.step()
 
             lr_h = optimizer1.param_groups[0]["lr"]
-            if val_top1 > best_val_acc:
-                best_val_acc = val_top1
-                save_ckpt(best_ckpt, model, optimizer1, scheduler1, epoch, best_val_acc, 1)
-            save_ckpt(latest_ckpt, model, optimizer1, scheduler1, epoch, best_val_acc, 1)
+            if do_save:
+                save_ckpt(best_ckpt, model, optimizer1, scheduler1, epoch, best_val_acc, 1,
+                          save_optim=save_optimizer)
 
             append_csv(log_path, 1, epoch, train_loss, val_loss, val_top1, val_top5, lr_h, lr_h)
+            wandb_log(run, 1, global_epoch, train_loss, train_acc,
+                      val_loss, val_top1, val_top5, lr_h, lr_h)
+            global_epoch += 1
             print(
-                f"[P1 E{epoch:02d}] loss={train_loss:.4f} | acc={train_acc:.4f} | "
+                f"[P1 E{epoch:02d}] loss={train_loss:.4f} | val_loss={val_loss:.4f} | "
                 f"val_top1={val_top1:.4f} | val_top5={val_top5:.4f} | "
                 f"lr={lr_h:.2e} | {time.time()-t0:.0f}s"
             )
@@ -548,7 +722,7 @@ def main():
             p.requires_grad = True
         enable_grad_checkpointing(model)
 
-        train_loader2, val_loader2 = make_loaders(train_ds, val_ds, cfg["phase23_batch_size"])
+        train_loader2, val_loader2 = make_loaders(train_ds, val_ds, cfg["phase23_batch_size"], cfg["seed"])
         steps_per_epoch = math.ceil(len(train_loader2) / cfg["grad_accum_steps"])
 
         criterion2 = LabelSmoothingCE(cfg["label_smoothing"])
@@ -575,17 +749,20 @@ def main():
             train_loss, train_acc = train_phase2(
                 model, train_loader2, criterion2, optimizer2, scaler2, scheduler2, cfg
             )
-            val_loss, val_top1, val_top5 = evaluate(model, val_loader2, criterion2)
+            val_loss, val_top1, val_top5, do_save, best_val_acc = eval_and_track(
+                model, val_loader2, criterion2, best_val_acc, full_train)
 
             lr_h, lr_lb = _get_lrs(optimizer2)
-            if val_top1 > best_val_acc:
-                best_val_acc = val_top1
-                save_ckpt(best_ckpt, model, optimizer2, scheduler2, epoch, best_val_acc, 2)
-            save_ckpt(latest_ckpt, model, optimizer2, scheduler2, epoch, best_val_acc, 2)
+            if do_save:
+                save_ckpt(best_ckpt, model, optimizer2, scheduler2, epoch, best_val_acc, 2,
+                          save_optim=save_optimizer)
 
             append_csv(log_path, 2, epoch, train_loss, val_loss, val_top1, val_top5, lr_h, lr_lb)
+            wandb_log(run, 2, global_epoch, train_loss, train_acc,
+                      val_loss, val_top1, val_top5, lr_h, lr_lb)
+            global_epoch += 1
             print(
-                f"[P2 E{epoch:02d}] loss={train_loss:.4f} | acc={train_acc:.4f} | "
+                f"[P2 E{epoch:02d}] loss={train_loss:.4f} | val_loss={val_loss:.4f} | "
                 f"val_top1={val_top1:.4f} | val_top5={val_top5:.4f} | "
                 f"lr_h={lr_h:.2e} lr_lb={lr_lb:.2e} | {time.time()-t0:.0f}s"
             )
@@ -593,17 +770,15 @@ def main():
         del train_loader2, val_loader2
 
     # ── Phase 3: Cosine Restart ───────────────────────────────────────────────
-    # ── Phase 3: Cosine Restart ───────────────────────────────────────────────
     print("\n=== Phase 3: Cosine Restart ===")
     torch.cuda.empty_cache()
 
     load_ckpt(best_ckpt, model)
     for p in model.parameters():
         p.requires_grad = True
-    # checkpointing already enabled from phase 2; re-enable after load_ckpt
-    enable_grad_checkpointing(model)
+    enable_grad_checkpointing(model)  # idempotent — no-op if phase 2 already enabled it
 
-    train_loader3, val_loader3 = make_loaders(train_ds, val_ds, cfg["phase23_batch_size"])
+    train_loader3, val_loader3 = make_loaders(train_ds, val_ds, cfg["phase23_batch_size"], cfg["seed"])
 
     criterion3 = nn.CrossEntropyLoss()
     print("LLRD param groups (phase 3):")
@@ -624,23 +799,34 @@ def main():
         train_loss, train_acc = train_phase3(
             model, train_loader3, criterion3, optimizer3, scaler3, cfg
         )
-        val_loss, val_top1, val_top5 = evaluate(model, val_loader3, criterion3)
+        val_loss, val_top1, val_top5, do_save, best_val_acc = eval_and_track(
+            model, val_loader3, criterion3, best_val_acc, full_train)
         scheduler3.step()
 
         lr_h, lr_lb = _get_lrs(optimizer3)
-        if val_top1 > best_val_acc:
-            best_val_acc = val_top1
-            save_ckpt(best_ckpt,  model, optimizer3, scheduler3, epoch, best_val_acc, 3)
-        save_ckpt(latest_ckpt, model, optimizer3, scheduler3, epoch, best_val_acc, 3)
+        if do_save:
+            save_ckpt(best_ckpt, model, optimizer3, scheduler3, epoch, best_val_acc, 3,
+                      save_optim=save_optimizer)
 
         append_csv(log_path, 3, epoch, train_loss, val_loss, val_top1, val_top5, lr_h, lr_lb)
+        wandb_log(run, 3, global_epoch, train_loss, train_acc,
+                  val_loss, val_top1, val_top5, lr_h, lr_lb)
+        global_epoch += 1
         print(
-            f"[P3 E{epoch:02d}] loss={train_loss:.4f} | acc={train_acc:.4f} | "
+            f"[P3 E{epoch:02d}] loss={train_loss:.4f} | val_loss={val_loss:.4f} | "
             f"val_top1={val_top1:.4f} | val_top5={val_top5:.4f} | "
             f"lr_h={lr_h:.2e} lr_lb={lr_lb:.2e} | {time.time()-t0:.0f}s"
         )
 
-    print(f"\nDone. Best val_top1={best_val_acc:.4f}. Checkpoint: {best_ckpt}")
+    if run is not None:
+        if not full_train:
+            run.summary["best_val_top1"] = best_val_acc
+        run.finish()
+
+    if full_train:
+        print(f"\nDone (full-train, no val). Final checkpoint: {best_ckpt}")
+    else:
+        print(f"\nDone. Best val_top1={best_val_acc:.4f}. Checkpoint: {best_ckpt}")
 
 
 if __name__ == "__main__":
