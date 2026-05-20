@@ -31,7 +31,7 @@ LR_BLOCKS_TOP_PHASE3 = 1e-5
 LR_BLOCKS_REST_PHASE3 = 1e-6
 PATIENCE_PHASE3 = 5
 
-WEIGHT_DECAY = 0.01
+WEIGHT_DECAY = 0.05
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 

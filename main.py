@@ -123,7 +123,7 @@ def main():
                 torch.save(model.state_dict(), args.ckpt)
                 run.save(args.ckpt)
 
-            print(f"[P1] Epoch {epoch:02d} | train_loss={train_loss:.4f} | val_acc={val_acc:.4f}")
+            print(f"[P1] Epoch {epoch:02d} | train_loss={train_loss:.4f} | train_acc={train_acc:.4f} | val_acc={val_acc:.4f}")
 
             if stopper(val_acc):
                 print(f"[P1] Early stop — val_acc flat for {PATIENCE_PHASE1} epochs. Advancing to phase 2.")

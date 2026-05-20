@@ -22,7 +22,13 @@ def download_data(data_dir: str) -> None:
 
 def get_transforms(model):
     data_config = timm.data.resolve_data_config({}, model=model)
-    train_transform = timm.data.create_transform(**data_config, is_training=True)
+    train_transform = timm.data.create_transform(
+        **data_config,
+        is_training=True,
+        auto_augment="3augment",  # grayscale + solarize + gaussian blur (EVA-02 paper default)
+        re_prob=0.25,             # random erasing — effective on small datasets
+        color_jitter=0.4,
+    )
     val_transform = timm.data.create_transform(**data_config, is_training=False)
     return train_transform, val_transform
 
