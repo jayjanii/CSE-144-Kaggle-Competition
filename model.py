@@ -2,16 +2,19 @@ import timm
 import torch
 
 from config import (
-    MODEL_NAME, NUM_CLASSES, DEVICE,
+    MODEL_NAME, NUM_CLASSES, DEVICE, DROP_PATH_RATE,
     LR_HEAD_PHASE2, LR_BACKBONE_PHASE2,
     LR_HEAD_PHASE3, LR_BLOCKS_TOP_PHASE3, LR_BLOCKS_REST_PHASE3,
 )
 
 
 def create_model(pretrained: bool = True) -> torch.nn.Module:
-    model = timm.create_model(MODEL_NAME, pretrained=pretrained, num_classes=NUM_CLASSES)
+    model = timm.create_model(
+        MODEL_NAME, pretrained=pretrained, num_classes=NUM_CLASSES,
+        drop_path_rate=DROP_PATH_RATE,
+    )
     model = model.to(DEVICE)
-    print(f"Model {MODEL_NAME} loaded (pretrained={pretrained}).")
+    print(f"Model {MODEL_NAME} loaded (pretrained={pretrained}, drop_path_rate={DROP_PATH_RATE}).")
     return model
 
 

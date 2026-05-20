@@ -29,7 +29,7 @@ class EarlyStopper:
         return self.counter >= self.patience
 
 
-def train_one_epoch(model, dataloader, criterion, optimizer, device, scaler: torch.amp.GradScaler):
+def train_one_epoch(model, dataloader, criterion, optimizer, device, scaler: torch.amp.GradScaler, mixup_fn=None):
     model.train()
     total_loss = 0.0
     correct = 0
@@ -37,6 +37,8 @@ def train_one_epoch(model, dataloader, criterion, optimizer, device, scaler: tor
 
     for inputs, labels in dataloader:
         inputs, labels = inputs.to(device), labels.to(device)
+        if mixup_fn is not None:
+            inputs, labels = mixup_fn(inputs, labels)
 
         optimizer.zero_grad()
         with torch.amp.autocast(device):
@@ -46,15 +48,18 @@ def train_one_epoch(model, dataloader, criterion, optimizer, device, scaler: tor
         scaler.step(optimizer)
         scaler.update()
 
-        predictions = outputs.argmax(dim=1)
+        preds = outputs.argmax(dim=1)
         total_loss += loss.item() * inputs.size(0)
-        correct += (predictions == labels).sum().item()
-        total += labels.size(0)
+        # hard labels unavailable when mixup active — skip accuracy tracking
+        if mixup_fn is None:
+            correct += (preds == labels).sum().item()
+        total += inputs.size(0)
 
-    return total_loss / total, correct / total
+    acc = correct / total if mixup_fn is None else float("nan")
+    return total_loss / total, acc
 
 
-def train_one_epoch_phase2(model, loader, criterion, optimizer, device, accum_steps, scaler: torch.amp.GradScaler):
+def train_one_epoch_phase2(model, loader, criterion, optimizer, device, accum_steps, scaler: torch.amp.GradScaler, mixup_fn=None):
     model.train()
     optimizer.zero_grad()
 
@@ -62,6 +67,8 @@ def train_one_epoch_phase2(model, loader, criterion, optimizer, device, accum_st
 
     for i, (images, labels) in enumerate(loader):
         images, labels = images.to(device), labels.to(device)
+        if mixup_fn is not None:
+            images, labels = mixup_fn(images, labels)
 
         with torch.amp.autocast(device):
             outputs = model(images)
@@ -74,10 +81,11 @@ def train_one_epoch_phase2(model, loader, criterion, optimizer, device, accum_st
             scaler.update()
             optimizer.zero_grad()
 
-        total_loss += loss.item() * accum_steps * labels.size(0)
+        total_loss += loss.item() * accum_steps * images.size(0)
         preds = outputs.argmax(dim=1)
-        total_correct += (preds == labels).sum().item()
-        total_samples += labels.size(0)
+        if mixup_fn is None:
+            total_correct += (preds == labels).sum().item()
+        total_samples += images.size(0)
 
     # flush any leftover gradients from the final partial accumulation window
     if (len(loader)) % accum_steps != 0:
@@ -85,4 +93,5 @@ def train_one_epoch_phase2(model, loader, criterion, optimizer, device, accum_st
         scaler.update()
         optimizer.zero_grad()
 
-    return total_loss / total_samples, total_correct / total_samples
+    acc = total_correct / total_samples if mixup_fn is None else float("nan")
+    return total_loss / total_samples, acc
