@@ -4,6 +4,8 @@ import torch
 import torch.nn as nn
 import wandb
 
+torch.backends.cudnn.benchmark = True
+
 from config import (
     DEVICE, CKPT, DATA_DIR,
     EPOCHS_PHASE1, EPOCHS_PHASE2, EPOCHS_PHASE3,
@@ -52,6 +54,7 @@ def main():
     download_data(args.data_dir)
 
     model = create_model(pretrained=True)
+    model = torch.compile(model)
 
     if args.resume:
         state = torch.load(args.resume, map_location=DEVICE)
@@ -105,10 +108,11 @@ def main():
         optimizer = torch.optim.AdamW(
             model.head.parameters(), lr=LR_HEAD_PHASE1, weight_decay=WEIGHT_DECAY
         )
+        scaler = torch.amp.GradScaler(DEVICE)
         stopper = EarlyStopper(patience=PATIENCE_PHASE1)
 
         for epoch in range(EPOCHS_PHASE1):
-            train_loss, train_acc = train_one_epoch(model, train_loader, criterion, optimizer, DEVICE)
+            train_loss, train_acc = train_one_epoch(model, train_loader, criterion, optimizer, DEVICE, scaler)
             val_loss, val_acc = evaluate(model, val_loader, criterion, DEVICE)
 
             run.log({"train/loss": train_loss, "train/acc": train_acc,
@@ -137,7 +141,6 @@ def main():
     # p2
     # ------------------------------------------------------------------
     print("Phase 2: top blocks + head...")
-    model.set_grad_checkpointing(True)
 
     param_groups = unfreeze_top_blocks(model)
     optimizer = torch.optim.AdamW(param_groups, weight_decay=WEIGHT_DECAY)

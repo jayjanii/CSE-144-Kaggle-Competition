@@ -29,9 +29,9 @@ class EarlyStopper:
         return self.counter >= self.patience
 
 
-def train_one_epoch(model, dataloader, criterion, optimizer, device):
+def train_one_epoch(model, dataloader, criterion, optimizer, device, scaler: torch.amp.GradScaler):
     model.train()
-    running_loss = 0.0
+    total_loss = 0.0
     correct = 0
     total = 0
 
@@ -39,17 +39,19 @@ def train_one_epoch(model, dataloader, criterion, optimizer, device):
         inputs, labels = inputs.to(device), labels.to(device)
 
         optimizer.zero_grad()
-        outputs = model(inputs)
-        loss = criterion(outputs, labels)
-        loss.backward()
-        optimizer.step()
+        with torch.amp.autocast(device):
+            outputs = model(inputs)
+            loss = criterion(outputs, labels)
+        scaler.scale(loss).backward()
+        scaler.step(optimizer)
+        scaler.update()
 
         predictions = outputs.argmax(dim=1)
-        running_loss += loss.item() * inputs.size(0)
+        total_loss += loss.item() * inputs.size(0)
         correct += (predictions == labels).sum().item()
         total += labels.size(0)
 
-    return running_loss / total, correct / total
+    return total_loss / total, correct / total
 
 
 def train_one_epoch_phase2(model, loader, criterion, optimizer, device, accum_steps, scaler: torch.amp.GradScaler):
@@ -72,7 +74,7 @@ def train_one_epoch_phase2(model, loader, criterion, optimizer, device, accum_st
             scaler.update()
             optimizer.zero_grad()
 
-        total_loss += loss.item() * accum_steps  # undo the division for logging
+        total_loss += loss.item() * accum_steps * labels.size(0)
         preds = outputs.argmax(dim=1)
         total_correct += (preds == labels).sum().item()
         total_samples += labels.size(0)
@@ -83,4 +85,4 @@ def train_one_epoch_phase2(model, loader, criterion, optimizer, device, accum_st
         scaler.update()
         optimizer.zero_grad()
 
-    return total_loss / len(loader), total_correct / total_samples
+    return total_loss / total_samples, total_correct / total_samples

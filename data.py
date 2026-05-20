@@ -59,7 +59,7 @@ def get_dataloaders(model, data_dir: str):
 
     n = len(train_base)
     train_size = int(0.8 * n)
-    indices = torch.randperm(n).tolist()
+    indices = torch.randperm(n, generator=torch.Generator().manual_seed(42)).tolist()
 
     train_dataset = Subset(train_base, indices[:train_size])
     val_dataset   = Subset(val_base,   indices[train_size:])

@@ -42,8 +42,17 @@ def unfreeze_all(model: torch.nn.Module):
     for param in model.parameters():
         param.requires_grad = True
 
+    accounted = set(
+        id(p)
+        for p in list(model.head.parameters())
+        + list(model.blocks[-4:].parameters())
+        + list(model.blocks[:-4].parameters())
+    )
+    other_params = [p for p in model.parameters() if id(p) not in accounted]
+
     return [
         {"params": model.head.parameters(),         "lr": LR_HEAD_PHASE3},
         {"params": model.blocks[-4:].parameters(),  "lr": LR_BLOCKS_TOP_PHASE3},
         {"params": model.blocks[:-4].parameters(),  "lr": LR_BLOCKS_REST_PHASE3},
+        {"params": other_params,                     "lr": LR_BLOCKS_REST_PHASE3},
     ]
