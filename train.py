@@ -81,7 +81,7 @@ def build_model(num_classes: int = 100) -> nn.Module:
 
 def get_train_transform(size: int = 448) -> A.Compose:
     return A.Compose([
-        A.RandomResizedCrop(size, size, scale=(0.4, 1.0), ratio=(0.75, 1.33)),
+        A.RandomResizedCrop(size=(size, size), scale=(0.4, 1.0), ratio=(0.75, 1.33)),
         A.HorizontalFlip(p=0.5),
         A.Rotate(limit=15, p=0.5),
         A.ShiftScaleRotate(
@@ -91,9 +91,9 @@ def get_train_transform(size: int = 448) -> A.Compose:
         A.ColorJitter(brightness=0.4, contrast=0.4, saturation=0.4, hue=0.1, p=0.8),
         A.ToGray(p=0.2),
         A.GaussianBlur(blur_limit=(3, 7), p=0.3),
-        A.GaussNoise(var_limit=(10, 50), p=0.2),
+        A.GaussNoise(p=0.2),
         A.CoarseDropout(
-            max_holes=8, max_height=56, max_width=56, min_holes=1,
+            num_holes_range=(1, 8), hole_height_range=(1, 56), hole_width_range=(1, 56),
             fill_value=0, p=0.4,
         ),
         A.GridDistortion(num_steps=5, distort_limit=0.3, p=0.2),
@@ -105,7 +105,7 @@ def get_train_transform(size: int = 448) -> A.Compose:
 def get_val_transform(size: int = 448) -> A.Compose:
     return A.Compose([
         A.SmallestMaxSize(max_size=480),
-        A.CenterCrop(size, size),
+        A.CenterCrop(height=size, width=size),
         A.Normalize(mean=DINOV2_MEAN, std=DINOV2_STD),
         ToTensorV2(),
     ])
