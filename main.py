@@ -54,7 +54,6 @@ def main():
     download_data(args.data_dir)
 
     model = create_model(pretrained=True)
-    model = torch.compile(model)
 
     if args.resume:
         state = torch.load(args.resume, map_location=DEVICE)
@@ -62,6 +61,7 @@ def main():
         print(f"Loaded checkpoint from {args.resume}")
 
     make_loaders = get_dataloaders(model, args.data_dir)
+    model = torch.compile(model)
 
     criterion = nn.CrossEntropyLoss()
 
