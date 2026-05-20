@@ -4,6 +4,9 @@ import torch
 import torch.nn as nn
 import wandb
 
+torch.backends.cudnn.benchmark = True
+torch.set_float32_matmul_precision("high")
+
 from config import (
     DEVICE, CKPT, DATA_DIR,
     EPOCHS_PHASE1, EPOCHS_PHASE2, EPOCHS_PHASE3,
@@ -60,7 +63,7 @@ def main():
 
     make_loaders = get_dataloaders(model, args.data_dir)
 
-    criterion = nn.CrossEntropyLoss()
+    criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
 
     run = wandb.init(
         project=WANDB_PROJECT,
