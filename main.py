@@ -43,6 +43,14 @@ def parse_args():
         "--ckpt", type=str, default=CKPT,
         help="Where to save the best checkpoint (default: CKPT_PATH env / 'best.pth').",
     )
+    parser.add_argument(
+        "--full-train", action="store_true",
+        help="Train on all 1000 images with no val split. Disables early stopping.",
+    )
+    parser.add_argument(
+        "--pseudo-labels", type=str, default=None, metavar="CSV",
+        help="Path to pseudo_labels.csv to augment training with high-confidence test predictions.",
+    )
     return parser.parse_args()
 
 
@@ -61,7 +69,11 @@ def main():
         model.load_state_dict(state)
         print(f"Loaded checkpoint from {args.resume}")
 
-    make_loaders = get_dataloaders(model, args.data_dir)
+    make_loaders = get_dataloaders(
+        model, args.data_dir,
+        full_train=args.full_train,
+        pseudo_labels_csv=args.pseudo_labels,
+    )
 
     criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
 
@@ -112,33 +124,40 @@ def main():
 
         for epoch in range(EPOCHS_PHASE1):
             train_loss, train_acc = train_one_epoch(model, train_loader, criterion, optimizer, DEVICE)
-            val_loss, val_acc = evaluate(model, val_loader, criterion, DEVICE)
 
-            run.log({"train/loss": train_loss, "train/acc": train_acc,
-                     "val/loss": val_loss, "val/acc": val_acc,
-                     "epoch": epoch, "phase": 1})
-
-            if val_acc > best_val_acc:
-                best_val_acc = val_acc
+            log = {"train/loss": train_loss, "train/acc": train_acc, "epoch": epoch, "phase": 1}
+            val_str = ""
+            if val_loader is not None:
+                val_loss, val_acc = evaluate(model, val_loader, criterion, DEVICE)
+                log.update({"val/loss": val_loss, "val/acc": val_acc})
+                if val_acc > best_val_acc:
+                    best_val_acc = val_acc
+                    torch.save(model.state_dict(), args.ckpt)
+                    run.save(args.ckpt)
+                if stopper(val_acc):
+                    run.log(log)
+                    print(f"[P1] Epoch {epoch:02d} | train_loss={train_loss:.4f} | train_acc={train_acc:.4f} | val_acc={val_acc:.4f}")
+                    print(f"[P1] Early stop — val_acc flat for {PATIENCE_PHASE1} epochs. Advancing to phase 2.")
+                    break
+                val_str = f" | val_acc={val_acc:.4f}"
+            else:
                 torch.save(model.state_dict(), args.ckpt)
                 run.save(args.ckpt)
 
-            print(f"[P1] Epoch {epoch:02d} | train_loss={train_loss:.4f} | train_acc={train_acc:.4f} | val_acc={val_acc:.4f}")
-
-            if stopper(val_acc):
-                print(f"[P1] Early stop — val_acc flat for {PATIENCE_PHASE1} epochs. Advancing to phase 2.")
-                break
+            run.log(log)
+            print(f"[P1] Epoch {epoch:02d} | train_loss={train_loss:.4f} | train_acc={train_acc:.4f}{val_str}")
     else:
         print("Skipping phase 1.")
-        # Track whatever the loaded checkpoint achieves so phase 2 still saves improvements.
-        _, best_val_acc = evaluate(model, val_loader, criterion, DEVICE)
-        print(f"Loaded checkpoint val_acc={best_val_acc:.4f}")
+        if val_loader is not None:
+            _, best_val_acc = evaluate(model, val_loader, criterion, DEVICE)
+            print(f"Loaded checkpoint val_acc={best_val_acc:.4f}")
 
     del train_loader, val_loader
 
     # ------------------------------------------------------------------
     # p2
     # ------------------------------------------------------------------
+    model.load_state_dict(torch.load(args.ckpt, map_location=DEVICE))
     print("Phase 2: top blocks + head...")
     model.set_grad_checkpointing(True)
 
@@ -154,30 +173,38 @@ def main():
         train_loss, train_acc = train_one_epoch_phase2(
             model, train_loader, criterion, optimizer, DEVICE, ACCUM_STEPS, scaler
         )
-        val_loss, val_acc = evaluate(model, val_loader, criterion, DEVICE)
         scheduler.step()
 
         phase1_offset = 0 if args.skip_phase1 else EPOCHS_PHASE1
-        run.log({"train/loss": train_loss, "train/acc": train_acc,
-                 "val/loss": val_loss, "val/acc": val_acc,
-                 "epoch": phase1_offset + epoch, "phase": 2})
-
-        if val_acc > best_val_acc:
-            best_val_acc = val_acc
+        log = {"train/loss": train_loss, "train/acc": train_acc,
+               "epoch": phase1_offset + epoch, "phase": 2}
+        val_str = ""
+        if val_loader is not None:
+            val_loss, val_acc = evaluate(model, val_loader, criterion, DEVICE)
+            log.update({"val/loss": val_loss, "val/acc": val_acc})
+            if val_acc > best_val_acc:
+                best_val_acc = val_acc
+                torch.save(model.state_dict(), args.ckpt)
+                run.save(args.ckpt)
+            if stopper(val_acc):
+                run.log(log)
+                print(f"[P2] Epoch {epoch:02d} | train_loss={train_loss:.4f} | train_acc={train_acc:.4f} | val_acc={val_acc:.4f}")
+                print(f"[P2] Early stop — val_acc flat for {PATIENCE_PHASE2} epochs. Advancing to phase 3.")
+                break
+            val_str = f" | val_acc={val_acc:.4f}"
+        else:
             torch.save(model.state_dict(), args.ckpt)
             run.save(args.ckpt)
 
-        print(f"[P2] Epoch {epoch:02d} | train_loss={train_loss:.4f} | train_acc={train_acc:.4f} | val_acc={val_acc:.4f}")
-
-        if stopper(val_acc):
-            print(f"[P2] Early stop — val_acc flat for {PATIENCE_PHASE2} epochs. Advancing to phase 3.")
-            break
+        run.log(log)
+        print(f"[P2] Epoch {epoch:02d} | train_loss={train_loss:.4f} | train_acc={train_acc:.4f}{val_str}")
 
     del train_loader, val_loader
 
     # ------------------------------------------------------------------
     # p3
     # ------------------------------------------------------------------
+    model.load_state_dict(torch.load(args.ckpt, map_location=DEVICE))
     print("Phase 3: full model fine-tuning...")
     param_groups = unfreeze_all(model)
     optimizer = torch.optim.AdamW(param_groups, weight_decay=WEIGHT_DECAY)
@@ -191,24 +218,31 @@ def main():
         train_loss, train_acc = train_one_epoch_phase2(
             model, train_loader, criterion, optimizer, DEVICE, ACCUM_STEPS_PHASE3, scaler
         )
-        val_loss, val_acc = evaluate(model, val_loader, criterion, DEVICE)
         scheduler.step()
 
         phase_offset = (0 if args.skip_phase1 else EPOCHS_PHASE1) + EPOCHS_PHASE2
-        run.log({"train/loss": train_loss, "train/acc": train_acc,
-                 "val/loss": val_loss, "val/acc": val_acc,
-                 "epoch": phase_offset + epoch, "phase": 3})
-
-        if val_acc > best_val_acc:
-            best_val_acc = val_acc
+        log = {"train/loss": train_loss, "train/acc": train_acc,
+               "epoch": phase_offset + epoch, "phase": 3}
+        val_str = ""
+        if val_loader is not None:
+            val_loss, val_acc = evaluate(model, val_loader, criterion, DEVICE)
+            log.update({"val/loss": val_loss, "val/acc": val_acc})
+            if val_acc > best_val_acc:
+                best_val_acc = val_acc
+                torch.save(model.state_dict(), args.ckpt)
+                run.save(args.ckpt)
+            if stopper(val_acc):
+                run.log(log)
+                print(f"[P3] Epoch {epoch:02d} | train_loss={train_loss:.4f} | train_acc={train_acc:.4f} | val_acc={val_acc:.4f}")
+                print(f"[P3] Early stop — val_acc flat for {PATIENCE_PHASE3} epochs. Training complete.")
+                break
+            val_str = f" | val_acc={val_acc:.4f}"
+        else:
             torch.save(model.state_dict(), args.ckpt)
             run.save(args.ckpt)
 
-        print(f"[P3] Epoch {epoch:02d} | train_loss={train_loss:.4f} | train_acc={train_acc:.4f} | val_acc={val_acc:.4f}")
-
-        if stopper(val_acc):
-            print(f"[P3] Early stop — val_acc flat for {PATIENCE_PHASE3} epochs. Training complete.")
-            break
+        run.log(log)
+        print(f"[P3] Epoch {epoch:02d} | train_loss={train_loss:.4f} | train_acc={train_acc:.4f}{val_str}")
 
     del train_loader, val_loader
 

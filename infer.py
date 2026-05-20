@@ -37,6 +37,8 @@ def parse_args():
     parser.add_argument("--output", type=str, default="submission.csv", help="Output CSV path")
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--num-workers", type=int, default=4)
+    parser.add_argument("--tta", action="store_true", help="Test-time augmentation: average over --tta-n augmented views")
+    parser.add_argument("--tta-n", type=int, default=5, help="Number of augmented views for TTA (default: 5)")
     return parser.parse_args()
 
 
@@ -58,14 +60,40 @@ def main():
     dataset = TestDataset(test_dir, transform)
     loader = DataLoader(dataset, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers, pin_memory=True)
 
-    rows = []
+    if args.tta:
+        tta_transform = timm.data.create_transform(
+            **data_config, is_training=True,
+            auto_augment="rand-m9-mstd0.5-inc1", re_prob=0.25, color_jitter=0.4,
+        )
+        tta_loader = DataLoader(
+            TestDataset(test_dir, tta_transform),
+            batch_size=args.batch_size, shuffle=False,
+            num_workers=args.num_workers, pin_memory=True,
+        )
+        print(f"TTA enabled: {args.tta_n} views")
+
+    all_filenames = []
+    cum_probs = None
+
     with torch.inference_mode():
+        # base pass (no augmentation)
         for images, filenames in loader:
             images = images.to(DEVICE)
-            outputs = model(images)
-            preds = outputs.argmax(dim=1).cpu().tolist()
-            for fname, pred in zip(filenames, preds):
-                rows.append((fname, pred))
+            probs = model(images).softmax(dim=1).cpu()
+            cum_probs = probs if cum_probs is None else torch.cat([cum_probs, probs])
+            all_filenames.extend(filenames)
+
+        if args.tta:
+            for _ in range(args.tta_n - 1):
+                run_probs = torch.cat([
+                    model(imgs.to(DEVICE)).softmax(dim=1).cpu()
+                    for imgs, _ in tta_loader
+                ])
+                cum_probs += run_probs
+            cum_probs /= args.tta_n
+
+    preds = cum_probs.argmax(dim=1).tolist()
+    rows = list(zip(all_filenames, preds))
 
     with open(args.output, "w", newline="") as f:
         writer = csv.writer(f)
