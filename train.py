@@ -21,7 +21,9 @@ from transformers import get_cosine_schedule_with_warmup
 CONFIG = {
     "num_classes": 100,
     "input_size": 448,
-    "batch_size": 128,
+    "batch_size": 128,          # phase 1 (frozen backbone, cheap)
+    "phase23_batch_size": 32,   # phases 2/3 (full backbone gradients)
+    "grad_accum_steps": 4,      # effective batch = 32 * 4 = 128
     "phase1_epochs": 5,
     "phase2_epochs": 30,
     "phase3_epochs": 15,
@@ -75,6 +77,17 @@ def build_model(num_classes: int = 100) -> nn.Module:
     nn.init.trunc_normal_(model.head.weight, std=0.02)
     nn.init.zeros_(model.head.bias)
     return model.to(DEVICE)
+
+
+def enable_grad_checkpointing(model: nn.Module) -> None:
+    """Wrap each transformer block's forward with torch.utils.checkpoint."""
+    import torch.utils.checkpoint as cp
+    for blk in model.blocks:
+        orig = blk.forward
+        def _cp(x, _f=orig):
+            return cp.checkpoint(_f, x, use_reentrant=False)
+        blk.forward = _cp
+    print("Gradient checkpointing enabled.")
 
 
 # ── Augmentation ──────────────────────────────────────────────────────────────
@@ -141,23 +154,24 @@ def _numeric_image_folder(root: str) -> datasets.ImageFolder:
     return ds
 
 
-def get_dataloaders(cfg: dict):
+def get_datasets(cfg: dict):
     size = cfg["input_size"]
-    bs = cfg["batch_size"]
-
     base_ds = _numeric_image_folder(cfg["train_dir"])
     n = len(base_ds)
     indices = torch.randperm(n, generator=torch.Generator().manual_seed(42)).tolist()
     train_idx = indices[: int(0.8 * n)]
     val_idx = indices[int(0.8 * n) :]
-
     train_ds = AlbumentationsDataset(Subset(base_ds, train_idx), get_train_transform(size))
     val_ds = AlbumentationsDataset(Subset(base_ds, val_idx), get_val_transform(size))
+    return train_ds, val_ds
 
-    loader_kwargs = dict(num_workers=8, pin_memory=True, persistent_workers=True)
-    train_loader = DataLoader(train_ds, batch_size=bs, shuffle=True, **loader_kwargs)
-    val_loader = DataLoader(val_ds, batch_size=bs, shuffle=False, **loader_kwargs)
-    return train_loader, val_loader
+
+def make_loaders(train_ds, val_ds, batch_size: int):
+    kw = dict(num_workers=4, pin_memory=True, persistent_workers=True)
+    return (
+        DataLoader(train_ds, batch_size=batch_size, shuffle=True, **kw),
+        DataLoader(val_ds,   batch_size=batch_size, shuffle=False, **kw),
+    )
 
 
 # ── MixUp / CutMix ───────────────────────────────────────────────────────────
@@ -385,55 +399,61 @@ def train_phase1(model, loader, criterion, optimizer) -> tuple[float, float]:
     return total_loss / total, total_correct / total
 
 
-def train_phase2(model, loader, criterion, optimizer, scaler, scheduler, cfg) -> tuple[float, float]:
-    """AMP + MixUp/CutMix + per-step scheduler (warmup+cosine from transformers)."""
+def _train_amp(model, loader, criterion, optimizer, scaler, cfg,
+               scheduler=None, accum_steps: int = 1) -> tuple[float, float]:
+    """
+    Shared AMP training loop for phases 2 and 3.
+    Gradient accumulation over `accum_steps` micro-batches.
+    If scheduler is provided it is stepped per optimizer step (transformers-style).
+    """
     model.train()
     total_loss = total_correct = total = 0
-    for x, y in loader:
+    optimizer.zero_grad()
+
+    for i, (x, y) in enumerate(loader):
         x, y = x.to(DEVICE), y.to(DEVICE)
         x, ya, yb, lam = apply_mix(x, y, cfg, use_mix=True)
 
-        optimizer.zero_grad()
         with torch.amp.autocast(DEVICE):
             logits = model(x)
-            loss = mixed_loss(criterion, logits, y, ya, yb, lam)
+            loss = mixed_loss(criterion, logits, y, ya, yb, lam) / accum_steps
 
         scaler.scale(loss).backward()
+
+        if (i + 1) % accum_steps == 0:
+            scaler.unscale_(optimizer)
+            nn.utils.clip_grad_norm_(model.parameters(), cfg["grad_clip"])
+            scaler.step(optimizer)
+            scaler.update()
+            if scheduler is not None:
+                scheduler.step()
+            optimizer.zero_grad()
+
+        total_loss += loss.item() * accum_steps * x.size(0)
+        total_correct += (logits.argmax(1) == y).sum().item()
+        total += x.size(0)
+
+    # flush any leftover partial accumulation window
+    if len(loader) % accum_steps != 0:
         scaler.unscale_(optimizer)
         nn.utils.clip_grad_norm_(model.parameters(), cfg["grad_clip"])
         scaler.step(optimizer)
         scaler.update()
-        scheduler.step()  # per-batch step for warmup scheduler
+        if scheduler is not None:
+            scheduler.step()
+        optimizer.zero_grad()
 
-        total_loss += loss.item() * x.size(0)
-        total_correct += (logits.argmax(1) == y).sum().item()
-        total += x.size(0)
     return total_loss / total, total_correct / total
+
+
+def train_phase2(model, loader, criterion, optimizer, scaler, scheduler, cfg) -> tuple[float, float]:
+    return _train_amp(model, loader, criterion, optimizer, scaler, cfg,
+                      scheduler=scheduler, accum_steps=cfg["grad_accum_steps"])
 
 
 def train_phase3(model, loader, criterion, optimizer, scaler, cfg) -> tuple[float, float]:
-    """AMP + MixUp/CutMix; caller steps scheduler per epoch."""
-    model.train()
-    total_loss = total_correct = total = 0
-    for x, y in loader:
-        x, y = x.to(DEVICE), y.to(DEVICE)
-        x, ya, yb, lam = apply_mix(x, y, cfg, use_mix=True)
-
-        optimizer.zero_grad()
-        with torch.amp.autocast(DEVICE):
-            logits = model(x)
-            loss = mixed_loss(criterion, logits, y, ya, yb, lam)
-
-        scaler.scale(loss).backward()
-        scaler.unscale_(optimizer)
-        nn.utils.clip_grad_norm_(model.parameters(), cfg["grad_clip"])
-        scaler.step(optimizer)
-        scaler.update()
-
-        total_loss += loss.item() * x.size(0)
-        total_correct += (logits.argmax(1) == y).sum().item()
-        total += x.size(0)
-    return total_loss / total, total_correct / total
+    return _train_amp(model, loader, criterion, optimizer, scaler, cfg,
+                      scheduler=None, accum_steps=cfg["grad_accum_steps"])
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -456,8 +476,8 @@ def main():
     print("Building DINOv2-Giant model...")
     model = build_model(cfg["num_classes"])
 
-    print("Preparing dataloaders...")
-    train_loader, val_loader = get_dataloaders(cfg)
+    print("Preparing datasets...")
+    train_ds, val_ds = get_datasets(cfg)
 
     best_val_acc = 0.0
 
@@ -467,6 +487,8 @@ def main():
         p.requires_grad = False
     for p in model.head.parameters():
         p.requires_grad = True
+
+    train_loader, val_loader = make_loaders(train_ds, val_ds, cfg["batch_size"])
 
     criterion1 = LabelSmoothingCE(cfg["label_smoothing"])
     optimizer1 = torch.optim.AdamW(
@@ -498,9 +520,17 @@ def main():
 
     # ── Phase 2: Full Fine-tune with LLRD ─────────────────────────────────────
     print("\n=== Phase 2: Full LLRD Fine-tune ===")
+    del train_loader, val_loader
+    torch.cuda.empty_cache()
+
     load_ckpt(best_ckpt, model)
     for p in model.parameters():
         p.requires_grad = True
+    enable_grad_checkpointing(model)
+
+    train_loader2, val_loader2 = make_loaders(train_ds, val_ds, cfg["phase23_batch_size"])
+    # optimizer steps per epoch = ceil(batches / accum_steps)
+    steps_per_epoch = math.ceil(len(train_loader2) / cfg["grad_accum_steps"])
 
     criterion2 = LabelSmoothingCE(cfg["label_smoothing"])
     print("LLRD param groups:")
@@ -512,7 +542,6 @@ def main():
         weight_decay=cfg["weight_decay"],
     )
 
-    steps_per_epoch = len(train_loader)
     total_steps = cfg["phase2_epochs"] * steps_per_epoch
     warmup_steps = cfg["warmup_epochs"] * steps_per_epoch
     scheduler2 = get_cosine_schedule_with_warmup(
@@ -525,9 +554,9 @@ def main():
     for epoch in range(cfg["phase2_epochs"]):
         t0 = time.time()
         train_loss, train_acc = train_phase2(
-            model, train_loader, criterion2, optimizer2, scaler2, scheduler2, cfg
+            model, train_loader2, criterion2, optimizer2, scaler2, scheduler2, cfg
         )
-        val_loss, val_top1, val_top5 = evaluate(model, val_loader, criterion2)
+        val_loss, val_top1, val_top5 = evaluate(model, val_loader2, criterion2)
 
         lr_h, lr_lb = _get_lrs(optimizer2)
         if val_top1 > best_val_acc:
@@ -544,9 +573,16 @@ def main():
 
     # ── Phase 3: Cosine Restart ───────────────────────────────────────────────
     print("\n=== Phase 3: Cosine Restart ===")
+    del train_loader2, val_loader2
+    torch.cuda.empty_cache()
+
     load_ckpt(best_ckpt, model)
     for p in model.parameters():
         p.requires_grad = True
+    # checkpointing already enabled from phase 2; re-enable after load_ckpt
+    enable_grad_checkpointing(model)
+
+    train_loader3, val_loader3 = make_loaders(train_ds, val_ds, cfg["phase23_batch_size"])
 
     criterion3 = nn.CrossEntropyLoss()
     print("LLRD param groups (phase 3):")
@@ -565,15 +601,15 @@ def main():
     for epoch in range(cfg["phase3_epochs"]):
         t0 = time.time()
         train_loss, train_acc = train_phase3(
-            model, train_loader, criterion3, optimizer3, scaler3, cfg
+            model, train_loader3, criterion3, optimizer3, scaler3, cfg
         )
-        val_loss, val_top1, val_top5 = evaluate(model, val_loader, criterion3)
+        val_loss, val_top1, val_top5 = evaluate(model, val_loader3, criterion3)
         scheduler3.step()
 
         lr_h, lr_lb = _get_lrs(optimizer3)
         if val_top1 > best_val_acc:
             best_val_acc = val_top1
-            save_ckpt(best_ckpt, model, optimizer3, scheduler3, epoch, best_val_acc, 3)
+            save_ckpt(best_ckpt,  model, optimizer3, scheduler3, epoch, best_val_acc, 3)
         save_ckpt(latest_ckpt, model, optimizer3, scheduler3, epoch, best_val_acc, 3)
 
         append_csv(log_path, 3, epoch, train_loss, val_loss, val_top1, val_top5, lr_h, lr_lb)
