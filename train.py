@@ -882,6 +882,14 @@ def parse_args():
         help="After training, TTA-evaluate the final model on the val split "
         "(LB-predictive number). Ignored in --full-train (no val split).",
     )
+    p.add_argument(
+        "--tta-sizes",
+        default=None,
+        metavar="A,B,C",
+        help="Comma-separated TTA crop sizes for --tta-val (overrides CONFIG). "
+        "Keep them ÷14 for ViT backbones; center on --input-size. Lets you sweep "
+        "TTA scales on labeled val data, e.g. with --skip-phase2 --skip-phase3.",
+    )
     # data / training mode
     p.add_argument(
         "--full-train",
@@ -961,6 +969,9 @@ def main():
             "pseudo_labels": args.pseudo_labels,
         }
     )
+    if args.tta_sizes:
+        cfg["tta_sizes"] = [int(s) for s in args.tta_sizes.split(",")]
+        print(f"TTA sizes overridden → {cfg['tta_sizes']}")
     full_train = args.full_train
     save_optimizer = args.save_optimizer
 
