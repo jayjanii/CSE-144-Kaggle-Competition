@@ -260,6 +260,20 @@ def get_datasets(cfg: dict, full_train: bool = False, pseudo_csv: str | None = N
     return train_ds, val_ds
 
 
+def get_val_raw(cfg: dict):
+    """Return [(PIL image, label)] for the val split — raw images for TTA eval.
+
+    Recreates the exact same seeded 80/20 split used by get_datasets().
+    """
+    base_ds = _numeric_image_folder(cfg["train_dir"])
+    n = len(base_ds)
+    indices = torch.randperm(
+        n, generator=torch.Generator().manual_seed(cfg["seed"])
+    ).tolist()
+    val_idx = indices[int(0.8 * n) :]
+    return [base_ds[i] for i in val_idx]  # (PIL image, int label)
+
+
 def make_loaders(train_ds, val_ds, batch_size: int, seed: int = 42):
     kw = dict(
         num_workers=4,
@@ -457,6 +471,34 @@ def eval_and_track(model, val_loader, criterion, best_val_acc, full_train):
         return val_loss, val_top1, val_top5, do_save, best_val_acc
     nan = float("nan")
     return nan, nan, nan, True, best_val_acc
+
+
+def tta_val_eval(model, cfg, best_ckpt, run):
+    """Evaluate the final (saved) model on the val split with test-time TTA.
+
+    This is the best cheap predictor of the leaderboard score for a given recipe,
+    since it measures exactly what inference.py measures (multi-scale + 5-crop +
+    flip), just on held-out labeled data. Reloads best_ckpt so it scores the
+    final saved model regardless of what's currently in memory.
+    """
+    from inference import run_tta  # local import avoids a circular import
+
+    load_ckpt(best_ckpt, model)
+    model.eval()
+    val_raw = get_val_raw(cfg)
+    correct = 0
+    for img, label in val_raw:
+        probs = run_tta(model, img, cfg)
+        if int(probs.argmax().item()) == label:
+            correct += 1
+    acc = correct / len(val_raw)
+    print(
+        f"[TTA-VAL] TTA val_top1 = {acc:.4f} over {len(val_raw)} images "
+        f"(tta_sizes={cfg['tta_sizes']}) — best single-crop val was logged above"
+    )
+    if run is not None:
+        run.summary["tta_val_top1"] = acc
+    return acc
 
 
 def swa_accumulate(swa_sd, model, n):
@@ -735,6 +777,12 @@ def parse_args():
         "--no-swa",
         action="store_true",
         help="Disable SWA weight averaging over phase 3 (use per-epoch best instead)",
+    )
+    p.add_argument(
+        "--tta-val",
+        action="store_true",
+        help="After training, TTA-evaluate the final model on the val split "
+        "(LB-predictive number). Ignored in --full-train (no val split).",
     )
     # data / training mode
     p.add_argument(
@@ -1101,6 +1149,13 @@ def main():
                 print(f"[SWA] saved averaged model ({swa_n} epochs) as final (full-train).")
 
         del train_loader3, val_loader3
+
+    # Optional: TTA evaluation on the val split — best cheap LB predictor
+    if args.tta_val and not full_train:
+        print("\nRunning TTA evaluation on the val split...")
+        tta_val_eval(model, cfg, best_ckpt, run)
+    elif args.tta_val and full_train:
+        print("\n--tta-val ignored: no val split in --full-train mode.")
 
     if run is not None:
         if not full_train:
