@@ -823,6 +823,7 @@ def parse_args():
 
 
 def main():
+    t_start = time.time()
     args = parse_args()
     cfg = dict(CONFIG)
     cfg.update(
@@ -1157,15 +1158,22 @@ def main():
     elif args.tta_val and full_train:
         print("\n--tta-val ignored: no val split in --full-train mode.")
 
+    elapsed = time.time() - t_start
+    h, rem = divmod(int(elapsed), 3600)
+    m, s = divmod(rem, 60)
+    elapsed_str = f"{h:d}h {m:02d}m {s:02d}s"
+
     if run is not None:
         if not full_train:
             run.summary["best_val_top1"] = best_val_acc
+        run.summary["total_time_sec"] = round(elapsed)
         run.finish()
 
     if full_train:
         print(f"\nDone (full-train, no val). Final checkpoint: {best_ckpt}")
     else:
         print(f"\nDone. Best val_top1={best_val_acc:.4f}. Checkpoint: {best_ckpt}")
+    print(f"Total time elapsed: {elapsed_str}")
 
 
 if __name__ == "__main__":
