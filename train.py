@@ -98,21 +98,79 @@ def maybe_download_data(cfg: dict) -> None:
 # ── Model ─────────────────────────────────────────────────────────────────────
 
 
+def is_dinov2(model_name: str) -> bool:
+    return model_name.startswith("dinov2")
+
+
 def build_model(num_classes: int = 100, model_name: str = "dinov2_vitg14_reg") -> nn.Module:
-    model = torch.hub.load("facebookresearch/dinov2", model_name)
-    model.head = nn.Linear(1536, num_classes)  # vit-g variants are all 1536-dim
-    nn.init.trunc_normal_(model.head.weight, std=0.02)
-    nn.init.zeros_(model.head.bias)
+    """Build a backbone with a fresh `num_classes` head.
+
+    DINOv2 variants load from torch.hub (embed dim 1536 for all ViT-g). Any other
+    name is treated as a timm model (CLIP / EVA-02 / SigLIP / ConvNeXt, etc.) so
+    ensemble members can come from a different pretraining family for decorrelated
+    errors. timm handles the classifier head via `num_classes`, and
+    `dynamic_img_size=True` lets ViT-style models interpolate their positional
+    embeddings so multi-scale TTA works the way it does for DINOv2.
+    """
+    if is_dinov2(model_name):
+        model = torch.hub.load("facebookresearch/dinov2", model_name)
+        model.head = nn.Linear(1536, num_classes)  # vit-g variants are all 1536-dim
+        nn.init.trunc_normal_(model.head.weight, std=0.02)
+        nn.init.zeros_(model.head.bias)
+        return model.to(DEVICE)
+
+    import timm
+
+    base = dict(pretrained=True, num_classes=num_classes)
+    try:
+        # ViT / EVA / SigLIP: interpolate pos-embeds for arbitrary input sizes
+        model = timm.create_model(model_name, dynamic_img_size=True, **base)
+    except TypeError:
+        # ConvNeXt and other size-agnostic backbones don't accept the kwarg
+        model = timm.create_model(model_name, **base)
     return model.to(DEVICE)
 
 
-def enable_grad_checkpointing(model: nn.Module) -> None:
-    """Wrap each transformer block's forward with torch.utils.checkpoint (idempotent)."""
-    import torch.utils.checkpoint as cp
+def get_classifier(model: nn.Module, model_name: str) -> nn.Module:
+    """Return the final classification layer regardless of backbone family."""
+    if is_dinov2(model_name):
+        return model.head
+    return model.get_classifier()
 
+
+def resolve_normalization(model: nn.Module, model_name: str) -> tuple[tuple, tuple]:
+    """(mean, std) the backbone was trained with.
+
+    DINOv2 uses ImageNet stats; timm models carry their own (CLIP/SigLIP differ),
+    so we read them from the model's data config — a mismatch here quietly wrecks
+    accuracy for a non-ImageNet-normalized member.
+    """
+    if is_dinov2(model_name):
+        return DINOV2_MEAN, DINOV2_STD
+    import timm
+
+    dc = timm.data.resolve_model_data_config(model)
+    return tuple(dc["mean"]), tuple(dc["std"])
+
+
+def enable_grad_checkpointing(model: nn.Module, model_name: str = "dinov2") -> None:
+    """Enable gradient checkpointing to fit large backbones in memory (idempotent)."""
     if getattr(model, "_grad_ckpt_enabled", False):
         print("Gradient checkpointing already enabled — skipping.")
         return
+
+    if not is_dinov2(model_name):
+        # timm exposes a first-class toggle that handles each architecture
+        try:
+            model.set_grad_checkpointing(True)
+            model._grad_ckpt_enabled = True
+            print("Gradient checkpointing enabled (timm).")
+        except Exception as e:  # pragma: no cover - depends on model support
+            print(f"timm grad checkpointing unsupported ({e}); continuing without.")
+        return
+
+    import torch.utils.checkpoint as cp
+
     for blk in model.blocks:
         orig = blk.forward
 
@@ -127,7 +185,9 @@ def enable_grad_checkpointing(model: nn.Module) -> None:
 # ── Augmentation ──────────────────────────────────────────────────────────────
 
 
-def get_train_transform(size: int = 448) -> A.Compose:
+def get_train_transform(
+    size: int = 448, mean: tuple = DINOV2_MEAN, std: tuple = DINOV2_STD
+) -> A.Compose:
     return A.Compose(
         [
             A.RandomResizedCrop(
@@ -154,13 +214,15 @@ def get_train_transform(size: int = 448) -> A.Compose:
                 p=0.4,
             ),
             A.GridDistortion(num_steps=5, distort_limit=0.3, p=0.2),
-            A.Normalize(mean=DINOV2_MEAN, std=DINOV2_STD),
+            A.Normalize(mean=mean, std=std),
             ToTensorV2(),
         ]
     )
 
 
-def get_val_transform(size: int = 448) -> A.Compose:
+def get_val_transform(
+    size: int = 448, mean: tuple = DINOV2_MEAN, std: tuple = DINOV2_STD
+) -> A.Compose:
     # Resize the short side slightly larger than the crop, scaled to `size`
     # (448 -> 480, same convention inference.py uses), so CenterCrop always fits.
     resize = int(round(size * 480 / 448))
@@ -168,7 +230,7 @@ def get_val_transform(size: int = 448) -> A.Compose:
         [
             A.SmallestMaxSize(max_size=resize),
             A.CenterCrop(height=size, width=size),
-            A.Normalize(mean=DINOV2_MEAN, std=DINOV2_STD),
+            A.Normalize(mean=mean, std=std),
             ToTensorV2(),
         ]
     )
@@ -229,7 +291,9 @@ def get_datasets(cfg: dict, full_train: bool = False, pseudo_csv: str | None = N
     """
     size = cfg["input_size"]
     seed = cfg["seed"]
-    train_tf = get_train_transform(size)
+    mean = cfg.get("norm_mean", DINOV2_MEAN)
+    std = cfg.get("norm_std", DINOV2_STD)
+    train_tf = get_train_transform(size, mean, std)
     base_ds = _numeric_image_folder(cfg["train_dir"])
     n = len(base_ds)
 
@@ -245,7 +309,7 @@ def get_datasets(cfg: dict, full_train: bool = False, pseudo_csv: str | None = N
         val_idx = indices[int(0.8 * n) :]
         train_core = AlbumentationsDataset(Subset(base_ds, train_idx), train_tf)
         val_ds = AlbumentationsDataset(
-            Subset(base_ds, val_idx), get_val_transform(size)
+            Subset(base_ds, val_idx), get_val_transform(size, mean, std)
         )
 
     if pseudo_csv:
@@ -432,12 +496,45 @@ def build_llrd_optimizer(
 
 
 def _get_lrs(optimizer) -> tuple[float, float]:
-    """Return (lr_head, lr_last_block). Groups: 0=head_d, 1=head_nd, 2=block[0]_d ..."""
-    lr_head = optimizer.param_groups[0]["lr"]
-    # block[39] decay group: index 2 + 39*2 = 80 (if all groups are present)
-    last_block_idx = 2 + (NUM_BLOCKS - 1) * 2
-    lr_last = optimizer.param_groups[last_block_idx]["lr"]
-    return lr_head, lr_last
+    """Return (highest_lr, lowest_lr) across param groups.
+
+    With LLRD the highest lr is the head and the lowest is the bottom block /
+    patch embed, so this is a backbone-agnostic summary that works for both the
+    custom DINOv2 optimizer and timm's layer-decay optimizer.
+    """
+    lrs = [g["lr"] for g in optimizer.param_groups if g["params"]]
+    return max(lrs), min(lrs)
+
+
+def build_finetune_optimizer(
+    model: nn.Module,
+    model_name: str,
+    base_lr: float,
+    decay: float,
+    head_lr_scale: float = 10,
+    weight_decay: float = 0.05,
+) -> torch.optim.Optimizer:
+    """LLRD AdamW for phases 2/3, dispatched per backbone family.
+
+    DINOv2 uses the hand-rolled per-block builder (40 blocks, head_lr_scale).
+    timm models use `create_optimizer_v2(..., layer_decay=...)`, which derives
+    the per-layer schedule from each architecture's own group_matcher.
+    """
+    if is_dinov2(model_name):
+        return build_llrd_optimizer(
+            model, base_lr, decay, head_lr_scale, weight_decay
+        )
+
+    from timm.optim import create_optimizer_v2
+
+    print(f"  timm layer-decay optimizer (base_lr={base_lr:.2e}, decay={decay})")
+    return create_optimizer_v2(
+        model,
+        opt="adamw",
+        lr=base_lr,
+        weight_decay=weight_decay,
+        layer_decay=decay,
+    )
 
 
 # ── Evaluation ────────────────────────────────────────────────────────────────
@@ -803,10 +900,21 @@ def parse_args():
     p.add_argument("--output-dir", default=CONFIG["output_dir"])
     # hyperparameter overrides (handy for Colab sweeps)
     p.add_argument("--model", default=CONFIG["model_name"],
-                   choices=["dinov2_vitg14", "dinov2_vitg14_reg"],
-                   help="Backbone — vary per ensemble member for error diversity")
+                   help="Backbone — vary per ensemble member for error diversity. "
+                        "DINOv2: dinov2_vitg14 / dinov2_vitg14_reg. Any other value is "
+                        "treated as a timm model for a different pretraining family, e.g. "
+                        "eva02_large_patch14_448.mim_m38m_ft_in22k_in1k, "
+                        "vit_large_patch14_clip_336.openai_ft_in12k_in1k, "
+                        "vit_so400m_patch14_siglip_384.webli_ft_in1k")
     p.add_argument("--input-size", type=int, default=CONFIG["input_size"],
-                   help="Training/val resolution (e.g. 448 or 518) — vary per ensemble member")
+                   help="Training/val resolution — vary per ensemble member. Match the "
+                        "timm model's native size (eva02_*_448 -> 448, *_clip_336 -> 336)")
+    p.add_argument("--phase2-base-lr", type=float, default=CONFIG["phase2_base_lr"],
+                   help="Phase-2 base LR (timm families often want a different value)")
+    p.add_argument("--phase3-base-lr", type=float, default=CONFIG["phase3_base_lr"],
+                   help="Phase-3 base LR")
+    p.add_argument("--llrd-decay", type=float, default=CONFIG["llrd_decay"],
+                   help="Layer-wise LR decay factor (0.9 DINOv2; 0.75 typical for EVA/CLIP)")
     p.add_argument("--phase1-epochs", type=int, default=CONFIG["phase1_epochs"])
     p.add_argument("--phase2-epochs", type=int, default=CONFIG["phase2_epochs"])
     p.add_argument("--phase3-epochs", type=int, default=CONFIG["phase3_epochs"])
@@ -843,6 +951,9 @@ def main():
             "phase1_epochs": args.phase1_epochs,
             "phase2_epochs": args.phase2_epochs,
             "phase3_epochs": args.phase3_epochs,
+            "phase2_base_lr": args.phase2_base_lr,
+            "phase3_base_lr": args.phase3_base_lr,
+            "llrd_decay": args.llrd_decay,
             "batch_size": args.batch_size,
             "phase23_batch_size": args.phase23_batch_size,
             "grad_accum_steps": args.grad_accum_steps,
@@ -871,6 +982,8 @@ def main():
 
     print(f"Building model {cfg['model_name']} @ {cfg['input_size']}px...")
     model = build_model(cfg["num_classes"], cfg["model_name"])
+    cfg["norm_mean"], cfg["norm_std"] = resolve_normalization(model, cfg["model_name"])
+    print(f"Normalization: mean={cfg['norm_mean']} std={cfg['norm_std']}")
 
     print("Preparing datasets...")
     train_ds, val_ds = get_datasets(
@@ -885,9 +998,10 @@ def main():
         _, best_val_acc = load_ckpt(best_ckpt, model)
     else:
         print("\n=== Phase 1: Head Warmup (frozen backbone) ===")
+        classifier = get_classifier(model, cfg["model_name"])
         for p in model.parameters():
             p.requires_grad = False
-        for p in model.head.parameters():
+        for p in classifier.parameters():
             p.requires_grad = True
 
         train_loader, val_loader = make_loaders(
@@ -897,7 +1011,7 @@ def main():
         criterion1 = LabelSmoothingCE(cfg["label_smoothing"])
         optimizer1 = torch.optim.AdamW(
             get_param_groups(
-                model.head.named_parameters(), cfg["phase1_lr"], cfg["weight_decay"]
+                classifier.named_parameters(), cfg["phase1_lr"], cfg["weight_decay"]
             ),
             betas=(0.9, 0.999),
         )
@@ -963,7 +1077,7 @@ def main():
         load_ckpt(best_ckpt, model)
         for p in model.parameters():
             p.requires_grad = True
-        enable_grad_checkpointing(model)
+        enable_grad_checkpointing(model, cfg["model_name"])
 
         train_loader2, val_loader2 = make_loaders(
             train_ds, val_ds, cfg["phase23_batch_size"], cfg["seed"]
@@ -972,8 +1086,9 @@ def main():
 
         criterion2 = LabelSmoothingCE(cfg["label_smoothing"])
         print("LLRD param groups:")
-        optimizer2 = build_llrd_optimizer(
+        optimizer2 = build_finetune_optimizer(
             model,
+            cfg["model_name"],
             base_lr=cfg["phase2_base_lr"],
             decay=cfg["llrd_decay"],
             head_lr_scale=cfg["head_lr_scale"],
@@ -1053,7 +1168,7 @@ def main():
         load_ckpt(best_ckpt, model)
         for p in model.parameters():
             p.requires_grad = True
-        enable_grad_checkpointing(model)  # idempotent — no-op if phase 2 already enabled it
+        enable_grad_checkpointing(model, cfg["model_name"])  # idempotent
 
         train_loader3, val_loader3 = make_loaders(
             train_ds, val_ds, cfg["phase23_batch_size"], cfg["seed"]
@@ -1061,8 +1176,9 @@ def main():
 
         criterion3 = nn.CrossEntropyLoss()
         print("LLRD param groups (phase 3):")
-        optimizer3 = build_llrd_optimizer(
+        optimizer3 = build_finetune_optimizer(
             model,
+            cfg["model_name"],
             base_lr=cfg["phase3_base_lr"],
             decay=cfg["llrd_decay"],
             head_lr_scale=cfg["head_lr_scale"],

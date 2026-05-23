@@ -10,17 +10,23 @@ from PIL import Image
 from torch.utils.data import DataLoader, Dataset
 
 # Re-use CONFIG and model builder from train.py
-from train import CONFIG, DEVICE, DINOV2_MEAN, DINOV2_STD, build_model
+from train import (
+    CONFIG,
+    DEVICE,
+    DINOV2_MEAN,
+    DINOV2_STD,
+    build_model,
+    resolve_normalization,
+)
 
 # ─────────────────────────────────────────────────────────────────────────────
 
-_NORMALIZE_MEAN = torch.tensor(DINOV2_MEAN).view(3, 1, 1)
-_NORMALIZE_STD = torch.tensor(DINOV2_STD).view(3, 1, 1)
 
-
-def _to_tensor_normalized(pil_img: Image.Image) -> torch.Tensor:
+def _to_tensor_normalized(
+    pil_img: Image.Image, mean: torch.Tensor, std: torch.Tensor
+) -> torch.Tensor:
     t = TF.to_tensor(pil_img)  # [3, H, W], float32 in [0,1]
-    return (t - _NORMALIZE_MEAN) / _NORMALIZE_STD
+    return (t - mean) / std
 
 
 def _five_crop(img: Image.Image, size: int) -> list[Image.Image]:
@@ -48,6 +54,9 @@ def run_tta(model: nn.Module, image: Image.Image, cfg: dict) -> torch.Tensor:
     model.eval()
     per_size_probs: list[torch.Tensor] = []
 
+    mean = torch.tensor(cfg.get("norm_mean", DINOV2_MEAN)).view(3, 1, 1)
+    std = torch.tensor(cfg.get("norm_std", DINOV2_STD)).view(3, 1, 1)
+
     with torch.inference_mode():
         for size in cfg["tta_sizes"]:
             # Resize so the shortest side is slightly larger than the crop size,
@@ -62,7 +71,7 @@ def run_tta(model: nn.Module, image: Image.Image, cfg: dict) -> torch.Tensor:
 
             views = []
             for crop in _five_crop(resized, size):
-                t = _to_tensor_normalized(crop)
+                t = _to_tensor_normalized(crop, mean, std)
                 views.append(t)
                 views.append(TF.hflip(t))  # flip the tensor directly
             batch = torch.stack(views).to(DEVICE)  # [10, 3, size, size]
@@ -114,8 +123,8 @@ def main():
                         help="Keep the N most-confident predictions instead of a fixed "
                              "threshold (calibration-robust; overrides --pseudo-threshold)")
     parser.add_argument("--model", default=cfg["model_name"],
-                        choices=["dinov2_vitg14", "dinov2_vitg14_reg"],
-                        help="Backbone — MUST match the checkpoint's training backbone")
+                        help="Backbone — MUST match the checkpoint's training backbone "
+                             "(dinov2_vitg14[_reg] or any timm model name)")
     parser.add_argument("--tta-sizes", default=None, metavar="A,B,C",
                         help="Comma-separated TTA crop sizes; overrides CONFIG. "
                              "Keep these centered on the TRAINING resolution "
@@ -136,6 +145,8 @@ def main():
 
     print(f"Loading model {args.model}...")
     model = build_model(cfg["num_classes"], args.model)
+    cfg["norm_mean"], cfg["norm_std"] = resolve_normalization(model, args.model)
+    print(f"Normalization: mean={cfg['norm_mean']} std={cfg['norm_std']}")
     ckpt = torch.load(args.ckpt, map_location=DEVICE)
     model.load_state_dict(ckpt["model"])
     model.eval()

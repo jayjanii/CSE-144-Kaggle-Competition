@@ -1,5 +1,6 @@
 torch
 torchvision
+timm
 albumentations
 transformers
 wandb
