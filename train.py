@@ -459,6 +459,23 @@ def eval_and_track(model, val_loader, criterion, best_val_acc, full_train):
     return nan, nan, nan, True, best_val_acc
 
 
+def swa_accumulate(swa_sd, model, n):
+    """Running average of model weights (SWA). Returns (swa_sd, new_n).
+
+    ViT uses LayerNorm (no BatchNorm running stats), so a plain weight average
+    needs no recalibration. Float tensors are averaged; the rest take the latest.
+    """
+    msd = model.state_dict()
+    if swa_sd is None:
+        return {k: v.detach().clone().float() for k, v in msd.items()}, 1
+    for k, v in msd.items():
+        if torch.is_floating_point(v):
+            swa_sd[k].mul_(n / (n + 1)).add_(v.detach().float(), alpha=1 / (n + 1))
+        else:
+            swa_sd[k] = v.detach().clone()
+    return swa_sd, n + 1
+
+
 # ── Checkpointing ─────────────────────────────────────────────────────────────
 
 
@@ -708,6 +725,16 @@ def parse_args():
         "--skip-phase2",
         action="store_true",
         help="Skip phases 1+2 and start from phase 3 using existing best.pth",
+    )
+    p.add_argument(
+        "--skip-phase3",
+        action="store_true",
+        help="Skip phase 3 entirely; final model is the phase-2 result",
+    )
+    p.add_argument(
+        "--no-swa",
+        action="store_true",
+        help="Disable SWA weight averaging over phase 3 (use per-epoch best instead)",
     )
     # data / training mode
     p.add_argument(
@@ -959,77 +986,121 @@ def main():
 
         del train_loader2, val_loader2
 
-    # ── Phase 3: Cosine Restart ───────────────────────────────────────────────
-    print("\n=== Phase 3: Cosine Restart ===")
-    torch.cuda.empty_cache()
+    # ── Phase 3: Cosine Restart + SWA ─────────────────────────────────────────
+    if args.skip_phase3:
+        print("\nSkipping phase 3 — final model is the phase-2 result.")
+    else:
+        print("\n=== Phase 3: Cosine Restart + SWA ===")
+        torch.cuda.empty_cache()
 
-    load_ckpt(best_ckpt, model)
-    for p in model.parameters():
-        p.requires_grad = True
-    enable_grad_checkpointing(model)  # idempotent — no-op if phase 2 already enabled it
+        load_ckpt(best_ckpt, model)
+        for p in model.parameters():
+            p.requires_grad = True
+        enable_grad_checkpointing(model)  # idempotent — no-op if phase 2 already enabled it
 
-    train_loader3, val_loader3 = make_loaders(
-        train_ds, val_ds, cfg["phase23_batch_size"], cfg["seed"]
-    )
-
-    criterion3 = nn.CrossEntropyLoss()
-    print("LLRD param groups (phase 3):")
-    optimizer3 = build_llrd_optimizer(
-        model,
-        base_lr=cfg["phase3_base_lr"],
-        decay=cfg["llrd_decay"],
-        head_lr_scale=cfg["head_lr_scale"],
-        weight_decay=cfg["weight_decay"],
-    )
-    scheduler3 = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
-        optimizer3, T_0=cfg["phase3_epochs"], eta_min=cfg["eta_min"]
-    )
-    scaler3 = torch.amp.GradScaler(DEVICE)
-
-    for epoch in range(cfg["phase3_epochs"]):
-        t0 = time.time()
-        train_loss, train_acc = train_phase3(
-            model, train_loader3, criterion3, optimizer3, scaler3, cfg
+        train_loader3, val_loader3 = make_loaders(
+            train_ds, val_ds, cfg["phase23_batch_size"], cfg["seed"]
         )
-        val_loss, val_top1, val_top5, do_save, best_val_acc = eval_and_track(
-            model, val_loader3, criterion3, best_val_acc, full_train
-        )
-        scheduler3.step()
 
-        lr_h, lr_lb = _get_lrs(optimizer3)
-        if do_save:
-            save_ckpt(
-                best_ckpt,
-                model,
-                optimizer3,
-                scheduler3,
-                epoch,
-                best_val_acc,
+        criterion3 = nn.CrossEntropyLoss()
+        print("LLRD param groups (phase 3):")
+        optimizer3 = build_llrd_optimizer(
+            model,
+            base_lr=cfg["phase3_base_lr"],
+            decay=cfg["llrd_decay"],
+            head_lr_scale=cfg["head_lr_scale"],
+            weight_decay=cfg["weight_decay"],
+        )
+        scheduler3 = torch.optim.lr_scheduler.CosineAnnealingWarmRestarts(
+            optimizer3, T_0=cfg["phase3_epochs"], eta_min=cfg["eta_min"]
+        )
+        scaler3 = torch.amp.GradScaler(DEVICE)
+
+        use_swa = not args.no_swa
+        swa_sd, swa_n = None, 0
+
+        for epoch in range(cfg["phase3_epochs"]):
+            t0 = time.time()
+            train_loss, train_acc = train_phase3(
+                model, train_loader3, criterion3, optimizer3, scaler3, cfg
+            )
+            val_loss, val_top1, val_top5, do_save, best_val_acc = eval_and_track(
+                model, val_loader3, criterion3, best_val_acc, full_train
+            )
+            scheduler3.step()
+
+            if use_swa:
+                swa_sd, swa_n = swa_accumulate(swa_sd, model, swa_n)
+
+            lr_h, lr_lb = _get_lrs(optimizer3)
+            # Keep per-epoch saves so best.pth always holds the best single epoch
+            # (val mode) / latest epoch (full-train); SWA may overwrite it below.
+            if do_save:
+                save_ckpt(
+                    best_ckpt,
+                    model,
+                    optimizer3,
+                    scheduler3,
+                    epoch,
+                    best_val_acc,
+                    3,
+                    save_optim=save_optimizer,
+                )
+
+            append_csv(
+                log_path, 3, epoch, train_loss, val_loss, val_top1, val_top5, lr_h, lr_lb
+            )
+            wandb_log(
+                run,
                 3,
-                save_optim=save_optimizer,
+                global_epoch,
+                train_loss,
+                train_acc,
+                val_loss,
+                val_top1,
+                val_top5,
+                lr_h,
+                lr_lb,
+            )
+            global_epoch += 1
+            print(
+                f"[P3 E{epoch:02d}] loss={train_loss:.4f} | val_loss={val_loss:.4f} | "
+                f"val_top1={val_top1:.4f} | val_top5={val_top5:.4f} | "
+                f"lr_h={lr_h:.2e} lr_lb={lr_lb:.2e} | {time.time() - t0:.0f}s"
             )
 
-        append_csv(
-            log_path, 3, epoch, train_loss, val_loss, val_top1, val_top5, lr_h, lr_lb
-        )
-        wandb_log(
-            run,
-            3,
-            global_epoch,
-            train_loss,
-            train_acc,
-            val_loss,
-            val_top1,
-            val_top5,
-            lr_h,
-            lr_lb,
-        )
-        global_epoch += 1
-        print(
-            f"[P3 E{epoch:02d}] loss={train_loss:.4f} | val_loss={val_loss:.4f} | "
-            f"val_top1={val_top1:.4f} | val_top5={val_top5:.4f} | "
-            f"lr_h={lr_h:.2e} lr_lb={lr_lb:.2e} | {time.time() - t0:.0f}s"
-        )
+        # ── Finalize SWA: load the averaged weights and decide whether to keep ──
+        if use_swa and swa_sd is not None:
+            model.load_state_dict(swa_sd)
+            if val_loader3 is not None:
+                _, swa_top1, _ = evaluate(model, val_loader3, criterion3)
+                print(
+                    f"[SWA] averaged {swa_n} epochs → val_top1={swa_top1:.4f} "
+                    f"(best single epoch was {best_val_acc:.4f})"
+                )
+                if run is not None:
+                    run.summary["swa_val_top1"] = swa_top1
+                if swa_top1 >= best_val_acc:
+                    best_val_acc = swa_top1
+                    save_ckpt(
+                        best_ckpt, model, optimizer3, scheduler3,
+                        cfg["phase3_epochs"], best_val_acc, 3,
+                        save_optim=save_optimizer,
+                    )
+                    print(f"[SWA] saved averaged model as best ({best_val_acc:.4f}).")
+                else:
+                    print("[SWA] averaged model worse than best epoch — keeping best epoch.")
+                    load_ckpt(best_ckpt, model)  # restore best epoch into memory
+            else:
+                # full-train: no val, so the SWA average is the robust endpoint
+                save_ckpt(
+                    best_ckpt, model, optimizer3, scheduler3,
+                    cfg["phase3_epochs"], best_val_acc, 3,
+                    save_optim=save_optimizer,
+                )
+                print(f"[SWA] saved averaged model ({swa_n} epochs) as final (full-train).")
+
+        del train_loader3, val_loader3
 
     if run is not None:
         if not full_train:

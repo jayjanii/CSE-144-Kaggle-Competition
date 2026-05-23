@@ -148,7 +148,7 @@ def main():
 
     for i, (img, fname) in enumerate(dataset):
         probs = run_tta(model, img, cfg)
-        image_id = os.path.splitext(fname)[0]
+        image_id = fname  # keep the original filename (e.g. "123.jpg")
         all_ids.append(image_id)
         all_fnames.append(fname)
         all_preds.append(int(probs.argmax().item()))
