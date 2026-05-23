@@ -110,6 +110,12 @@ def main():
                         help="Also write a pseudo_labels.csv of high-confidence test predictions")
     parser.add_argument("--pseudo-threshold", type=float, default=0.95,
                         help="Min TTA softmax confidence to keep a pseudo-label (default: 0.95)")
+    parser.add_argument("--pseudo-topk", type=int, default=None, metavar="N",
+                        help="Keep the N most-confident predictions instead of a fixed "
+                             "threshold (calibration-robust; overrides --pseudo-threshold)")
+    parser.add_argument("--model", default=cfg["model_name"],
+                        choices=["dinov2_vitg14", "dinov2_vitg14_reg"],
+                        help="Backbone — MUST match the checkpoint's training backbone")
     parser.add_argument("--tta-sizes", default=None, metavar="A,B,C",
                         help="Comma-separated TTA crop sizes; overrides CONFIG. "
                              "Keep these centered on the TRAINING resolution "
@@ -128,8 +134,8 @@ def main():
     from train import maybe_download_data
     maybe_download_data(cfg)
 
-    print("Loading model...")
-    model = build_model(cfg["num_classes"])
+    print(f"Loading model {args.model}...")
+    model = build_model(cfg["num_classes"], args.model)
     ckpt = torch.load(args.ckpt, map_location=DEVICE)
     model.load_state_dict(ckpt["model"])
     model.eval()
@@ -177,17 +183,29 @@ def main():
         parent = os.path.dirname(args.pseudo_labels_out)
         if parent:
             os.makedirs(parent, exist_ok=True)
-        kept = 0
+        # score every image by its TTA-averaged top-1 confidence
+        scored = []
+        for fname, probs in zip(all_fnames, all_probs):
+            conf, lab = probs.max(dim=0)
+            scored.append((conf.item(), fname, int(lab.item())))
+        scored.sort(reverse=True)  # most confident first
+
+        if args.pseudo_topk:
+            # calibration-robust: keep the N most confident regardless of absolute value
+            kept_rows = scored[: args.pseudo_topk]
+            criterion = f"top-{args.pseudo_topk}"
+        else:
+            kept_rows = [s for s in scored if s[0] >= args.pseudo_threshold]
+            criterion = f"thr={args.pseudo_threshold}"
+
         with open(args.pseudo_labels_out, "w", newline="") as f:
             w = csv.writer(f)
             w.writerow(["filename", "label", "confidence"])
-            for fname, probs in zip(all_fnames, all_probs):
-                conf, lab = probs.max(dim=0)
-                if conf.item() >= args.pseudo_threshold:
-                    w.writerow([fname, int(lab.item()), f"{conf.item():.4f}"])
-                    kept += 1
-        print(f"Pseudo-labels: kept {kept}/{len(all_fnames)} "
-              f"(thr={args.pseudo_threshold}) → {args.pseudo_labels_out}")
+            for conf, fname, lab in kept_rows:
+                w.writerow([fname, lab, f"{conf:.4f}"])
+        min_conf = kept_rows[-1][0] if kept_rows else 0.0
+        print(f"Pseudo-labels: kept {len(kept_rows)}/{len(all_fnames)} "
+              f"({criterion}, min conf {min_conf:.3f}) → {args.pseudo_labels_out}")
 
     if args.wandb:
         try:

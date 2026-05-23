@@ -20,6 +20,7 @@ from transformers import get_cosine_schedule_with_warmup
 # ── CONFIG ────────────────────────────────────────────────────────────────────
 CONFIG = {
     "num_classes": 100,
+    "model_name": "dinov2_vitg14_reg",  # or "dinov2_vitg14" (both embed dim 1536)
     "input_size": 518,
     "batch_size": 128,  # phase 1 (frozen backbone, cheap)
     "phase23_batch_size": 32,  # phases 2/3 (full backbone gradients)
@@ -97,9 +98,9 @@ def maybe_download_data(cfg: dict) -> None:
 # ── Model ─────────────────────────────────────────────────────────────────────
 
 
-def build_model(num_classes: int = 100) -> nn.Module:
-    model = torch.hub.load("facebookresearch/dinov2", "dinov2_vitg14_reg")
-    model.head = nn.Linear(1536, num_classes)
+def build_model(num_classes: int = 100, model_name: str = "dinov2_vitg14_reg") -> nn.Module:
+    model = torch.hub.load("facebookresearch/dinov2", model_name)
+    model.head = nn.Linear(1536, num_classes)  # vit-g variants are all 1536-dim
     nn.init.trunc_normal_(model.head.weight, std=0.02)
     nn.init.zeros_(model.head.bias)
     return model.to(DEVICE)
@@ -801,6 +802,11 @@ def parse_args():
     p.add_argument("--test-dir", default=CONFIG["test_dir"])
     p.add_argument("--output-dir", default=CONFIG["output_dir"])
     # hyperparameter overrides (handy for Colab sweeps)
+    p.add_argument("--model", default=CONFIG["model_name"],
+                   choices=["dinov2_vitg14", "dinov2_vitg14_reg"],
+                   help="Backbone — vary per ensemble member for error diversity")
+    p.add_argument("--input-size", type=int, default=CONFIG["input_size"],
+                   help="Training/val resolution (e.g. 448 or 518) — vary per ensemble member")
     p.add_argument("--phase1-epochs", type=int, default=CONFIG["phase1_epochs"])
     p.add_argument("--phase2-epochs", type=int, default=CONFIG["phase2_epochs"])
     p.add_argument("--phase3-epochs", type=int, default=CONFIG["phase3_epochs"])
@@ -829,6 +835,8 @@ def main():
     cfg.update(
         {
             "seed": args.seed,
+            "model_name": args.model,
+            "input_size": args.input_size,
             "train_dir": args.train_dir,
             "test_dir": args.test_dir,
             "output_dir": args.output_dir,
@@ -861,8 +869,8 @@ def main():
 
     maybe_download_data(cfg)
 
-    print("Building DINOv2-Giant model...")
-    model = build_model(cfg["num_classes"])
+    print(f"Building model {cfg['model_name']} @ {cfg['input_size']}px...")
+    model = build_model(cfg["num_classes"], cfg["model_name"])
 
     print("Preparing datasets...")
     train_ds, val_ds = get_datasets(
