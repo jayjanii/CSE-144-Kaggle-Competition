@@ -149,7 +149,7 @@ def get_train_transform(size: int = 448) -> A.Compose:
                 num_holes_range=(1, 8),
                 hole_height_range=(1, 56),
                 hole_width_range=(1, 56),
-                fill_value=0,
+                fill=0,
                 p=0.4,
             ),
             A.GridDistortion(num_steps=5, distort_limit=0.3, p=0.2),
@@ -160,9 +160,12 @@ def get_train_transform(size: int = 448) -> A.Compose:
 
 
 def get_val_transform(size: int = 448) -> A.Compose:
+    # Resize the short side slightly larger than the crop, scaled to `size`
+    # (448 -> 480, same convention inference.py uses), so CenterCrop always fits.
+    resize = int(round(size * 480 / 448))
     return A.Compose(
         [
-            A.SmallestMaxSize(max_size=480),
+            A.SmallestMaxSize(max_size=resize),
             A.CenterCrop(height=size, width=size),
             A.Normalize(mean=DINOV2_MEAN, std=DINOV2_STD),
             ToTensorV2(),
