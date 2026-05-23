@@ -40,7 +40,7 @@ CONFIG = {
     "grad_clip": 1.0,
     "warmup_epochs": 1,
     "eta_min": 1e-7,
-    "tta_sizes": [392, 448, 518],
+    "tta_sizes": [448, 518, 588],  # keep centered on input_size (train res)
     "train_dir": "data/train",
     "test_dir": "data/test",
     "output_dir": os.environ.get("OUTPUT_DIR", "outputs/"),

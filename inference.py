@@ -41,11 +41,12 @@ def _five_crop(img: Image.Image, size: int) -> list[Image.Image]:
 
 def run_tta(model: nn.Module, image: Image.Image, cfg: dict) -> torch.Tensor:
     """
-    3 resolutions × 5 crops × 2 (orig + hflip) = 30 forward passes.
-    Returns averaged softmax probabilities of shape [num_classes].
+    len(tta_sizes) resolutions × 5 crops × 2 (orig + hflip) views.
+    The 10 views per resolution are batched into a single forward pass, so this
+    is len(tta_sizes) forwards per image instead of 30. Returns the mean softmax.
     """
     model.eval()
-    all_probs: list[torch.Tensor] = []
+    per_size_probs: list[torch.Tensor] = []
 
     with torch.inference_mode():
         for size in cfg["tta_sizes"]:
@@ -59,16 +60,17 @@ def run_tta(model: nn.Module, image: Image.Image, cfg: dict) -> torch.Tensor:
             new_W, new_H = max(new_W, size), max(new_H, size)
             resized = image.resize((new_W, new_H), Image.BICUBIC)
 
-            crops = _five_crop(resized, size)
-            for crop in crops:
-                for flipped in (False, True):
-                    aug = TF.hflip(crop) if flipped else crop
-                    tensor = _to_tensor_normalized(aug).unsqueeze(0).to(DEVICE)
-                    with torch.amp.autocast(DEVICE):
-                        probs = model(tensor).softmax(dim=1).squeeze(0).cpu()
-                    all_probs.append(probs)
+            views = []
+            for crop in _five_crop(resized, size):
+                t = _to_tensor_normalized(crop)
+                views.append(t)
+                views.append(TF.hflip(t))  # flip the tensor directly
+            batch = torch.stack(views).to(DEVICE)  # [10, 3, size, size]
+            with torch.amp.autocast(DEVICE):
+                probs = model(batch).softmax(dim=1).cpu()  # [10, num_classes]
+            per_size_probs.append(probs)
 
-    return torch.stack(all_probs).mean(dim=0)
+    return torch.cat(per_size_probs, dim=0).mean(dim=0)
 
 
 # ── Test dataset ──────────────────────────────────────────────────────────────
@@ -108,7 +110,16 @@ def main():
                         help="Also write a pseudo_labels.csv of high-confidence test predictions")
     parser.add_argument("--pseudo-threshold", type=float, default=0.95,
                         help="Min TTA softmax confidence to keep a pseudo-label (default: 0.95)")
+    parser.add_argument("--tta-sizes", default=None, metavar="A,B,C",
+                        help="Comma-separated TTA crop sizes; overrides CONFIG. "
+                             "Keep these centered on the TRAINING resolution "
+                             f"(default: {cfg['tta_sizes']}).")
     args = parser.parse_args()
+
+    if args.tta_sizes:
+        cfg = dict(cfg)  # don't mutate the shared CONFIG
+        cfg["tta_sizes"] = [int(s) for s in args.tta_sizes.split(",")]
+        print(f"TTA sizes overridden → {cfg['tta_sizes']}")
 
     os.makedirs(args.output_dir, exist_ok=True)
     sub_path = os.path.join(args.output_dir, "submission.csv")
