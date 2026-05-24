@@ -125,6 +125,10 @@ def main():
     parser.add_argument("--model", default=cfg["model_name"],
                         help="Backbone — MUST match the checkpoint's training backbone "
                              "(dinov2_vitg14[_reg] or any timm model name)")
+    parser.add_argument("--input-size", type=int, default=cfg["input_size"],
+                        help="Training resolution of the checkpoint (informational / "
+                             "parity with train.py). Inference resolution is driven by "
+                             "--tta-sizes; timm backbones interpolate pos-embeds per scale.")
     parser.add_argument("--tta-sizes", default=None, metavar="A,B,C",
                         help="Comma-separated TTA crop sizes; overrides CONFIG. "
                              "Keep these centered on the TRAINING resolution "

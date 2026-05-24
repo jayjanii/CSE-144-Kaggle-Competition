@@ -527,14 +527,28 @@ def build_finetune_optimizer(
 
     from timm.optim import create_optimizer_v2
 
-    print(f"  timm layer-decay optimizer (base_lr={base_lr:.2e}, decay={decay})")
-    return create_optimizer_v2(
+    optimizer = create_optimizer_v2(
         model,
         opt="adamw",
         lr=base_lr,
         weight_decay=weight_decay,
         layer_decay=decay,
     )
+    # timm stores the per-layer factor in group["lr_scale"] and relies on a *timm*
+    # scheduler to multiply it in. We drive these optimizers with torch/transformers
+    # schedulers that ignore "lr_scale", so bake it into the group LR now — before
+    # any scheduler captures the base LRs — otherwise every layer trains at base_lr
+    # and --llrd-decay is a no-op.
+    for g in optimizer.param_groups:
+        scale = g.get("lr_scale", 1.0)
+        if scale != 1.0:
+            g["lr"] *= scale
+    lrs = [g["lr"] for g in optimizer.param_groups if g["params"]]
+    print(
+        f"  timm layer-decay optimizer (base_lr={base_lr:.2e}, decay={decay}, "
+        f"lr range {min(lrs):.2e}–{max(lrs):.2e})"
+    )
+    return optimizer
 
 
 # ── Evaluation ────────────────────────────────────────────────────────────────
