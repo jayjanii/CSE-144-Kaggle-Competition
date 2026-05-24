@@ -47,6 +47,8 @@ CONFIG = {
     "output_dir": os.environ.get("OUTPUT_DIR", "outputs/"),
     "kaggle_competition": "ucsc-cse-144-spring-2026-final-project",
     "seed": 42,
+    "kfold": None,  # K-fold CV: None → original seeded 80/20 split
+    "fold_idx": 0,  # which fold is held out for validation when kfold is set
     "wandb_project": os.environ.get("WANDB_PROJECT", "cse144-final"),
     "wandb_entity": os.environ.get("WANDB_ENTITY", "jay_jani-university-of-california"),
     "wandb_mode": os.environ.get("WANDB_MODE", "online"),
@@ -283,6 +285,45 @@ def _numeric_image_folder(root: str) -> datasets.ImageFolder:
     return ds
 
 
+def _fold_assignment(targets, n_folds: int, seed: int):
+    """Deterministic stratified fold id for every labeled sample.
+
+    Each class's samples are shuffled with a seeded RNG and round-robin assigned
+    to folds, so folds are class-balanced and — given the same (n_folds, seed) —
+    identical across models/runs. That alignment is what lets the per-model OOF
+    files stitch together image-for-image later.
+    """
+    targets = np.asarray(targets)
+    fold_of = np.empty(len(targets), dtype=int)
+    rng = np.random.RandomState(seed)
+    for c in np.unique(targets):
+        idx_c = np.where(targets == c)[0]
+        rng.shuffle(idx_c)
+        fold_of[idx_c] = np.arange(len(idx_c)) % n_folds
+    return fold_of
+
+
+def _split_indices(base_ds, cfg: dict):
+    """Return (train_idx, val_idx), fully determined by cfg['seed'].
+
+    K-fold (leak-free CV over all labeled data) when cfg['kfold'] is set: train on
+    every fold but cfg['fold_idx'], validate on that held-out fold. Otherwise the
+    original seeded 80/20 split.
+    """
+    n = len(base_ds)
+    kfold = cfg.get("kfold")
+    if kfold:
+        fold_of = _fold_assignment(base_ds.targets, kfold, cfg["seed"])
+        fi = cfg["fold_idx"]
+        val_idx = np.where(fold_of == fi)[0].tolist()
+        train_idx = np.where(fold_of != fi)[0].tolist()
+        return train_idx, val_idx
+    indices = torch.randperm(
+        n, generator=torch.Generator().manual_seed(cfg["seed"])
+    ).tolist()
+    return indices[: int(0.8 * n)], indices[int(0.8 * n) :]
+
+
 def get_datasets(cfg: dict, full_train: bool = False, pseudo_csv: str | None = None):
     """Build (train_ds, val_ds).
 
@@ -290,7 +331,6 @@ def get_datasets(cfg: dict, full_train: bool = False, pseudo_csv: str | None = N
     pseudo_csv: append high-confidence pseudo-labeled test images to the train set.
     """
     size = cfg["input_size"]
-    seed = cfg["seed"]
     mean = cfg.get("norm_mean", DINOV2_MEAN)
     std = cfg.get("norm_std", DINOV2_STD)
     train_tf = get_train_transform(size, mean, std)
@@ -302,15 +342,17 @@ def get_datasets(cfg: dict, full_train: bool = False, pseudo_csv: str | None = N
         val_ds = None
         print(f"Full-train mode: using all {n} labeled images, no val split.")
     else:
-        indices = torch.randperm(
-            n, generator=torch.Generator().manual_seed(seed)
-        ).tolist()
-        train_idx = indices[: int(0.8 * n)]
-        val_idx = indices[int(0.8 * n) :]
+        train_idx, val_idx = _split_indices(base_ds, cfg)
         train_core = AlbumentationsDataset(Subset(base_ds, train_idx), train_tf)
         val_ds = AlbumentationsDataset(
             Subset(base_ds, val_idx), get_val_transform(size, mean, std)
         )
+        split = (
+            f"fold {cfg['fold_idx']}/{cfg['kfold']}"
+            if cfg.get("kfold")
+            else "seeded 80/20"
+        )
+        print(f"{split} split: {len(train_idx)} train / {len(val_idx)} val.")
 
     if pseudo_csv:
         pseudo_base = PseudoLabelDataset(pseudo_csv, cfg["test_dir"])
@@ -328,14 +370,11 @@ def get_datasets(cfg: dict, full_train: bool = False, pseudo_csv: str | None = N
 def get_val_raw(cfg: dict):
     """Return [(PIL image, label)] for the val split — raw images for TTA eval.
 
-    Recreates the exact same seeded 80/20 split used by get_datasets().
+    Recreates the exact same split used by get_datasets() (seeded 80/20, or the
+    held-out fold when cfg['kfold'] is set).
     """
     base_ds = _numeric_image_folder(cfg["train_dir"])
-    n = len(base_ds)
-    indices = torch.randperm(
-        n, generator=torch.Generator().manual_seed(cfg["seed"])
-    ).tolist()
-    val_idx = indices[int(0.8 * n) :]
+    _, val_idx = _split_indices(base_ds, cfg)
     return [base_ds[i] for i in val_idx]  # (PIL image, int label)
 
 
@@ -610,6 +649,43 @@ def tta_val_eval(model, cfg, best_ckpt, run):
     )
     if run is not None:
         run.summary["tta_val_top1"] = acc
+    return acc
+
+
+def oof_predict_and_save(model, cfg, best_ckpt, out_path):
+    """Write leak-free out-of-fold TTA predictions for the held-out fold.
+
+    Reloads the final saved model and runs the same multi-scale + 5-crop + flip
+    TTA as inference.py over every image in fold cfg['fold_idx'] (which this run
+    did NOT train on). Output CSV columns:
+        index,path,label,0,1,...,<num_classes-1>
+    where `index` is the position in the deterministic ImageFolder ordering, so
+    the per-fold files stitch into exactly one prediction per labeled image.
+    Combine and analyze the folds with oof.py.
+    """
+    from inference import run_tta  # local import avoids a circular import
+
+    load_ckpt(best_ckpt, model)
+    model.eval()
+    base_ds = _numeric_image_folder(cfg["train_dir"])
+    _, val_idx = _split_indices(base_ds, cfg)
+    nc = cfg["num_classes"]
+    correct = 0
+    with open(out_path, "w", newline="") as f:
+        w = csv.writer(f)
+        w.writerow(["index", "path", "label"] + [str(c) for c in range(nc)])
+        for i in val_idx:
+            img, label = base_ds[i]
+            path = base_ds.samples[i][0]
+            probs = run_tta(model, img, cfg)
+            if int(probs.argmax().item()) == label:
+                correct += 1
+            w.writerow([i, path, label] + [f"{x:.6f}" for x in probs.tolist()])
+    acc = correct / len(val_idx)
+    print(
+        f"[OOF] fold {cfg['fold_idx']}/{cfg['kfold']}: {len(val_idx)} preds → "
+        f"{out_path} (fold TTA acc {acc:.4f})"
+    )
     return acc
 
 
@@ -916,6 +992,22 @@ def parse_args():
         metavar="CSV",
         help="Path to pseudo_labels.csv (from inference.py) to append to training",
     )
+    p.add_argument(
+        "--kfold",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Enable N-fold stratified CV: train on every fold but --fold-idx and "
+        "validate on it (replaces the 80/20 split). Writes oof_fold<i>.csv of "
+        "leak-free TTA preds. Run all N folds, then stitch/analyze with oof.py.",
+    )
+    p.add_argument(
+        "--fold-idx",
+        type=int,
+        default=0,
+        metavar="I",
+        help="Which fold (0..N-1) is held out for validation this run (with --kfold)",
+    )
     p.add_argument("--seed", type=int, default=CONFIG["seed"])
     p.add_argument("--train-dir", default=CONFIG["train_dir"])
     p.add_argument("--test-dir", default=CONFIG["test_dir"])
@@ -981,8 +1073,17 @@ def main():
             "grad_accum_steps": args.grad_accum_steps,
             "full_train": args.full_train,
             "pseudo_labels": args.pseudo_labels,
+            "kfold": args.kfold,
+            "fold_idx": args.fold_idx,
         }
     )
+    if args.kfold:
+        if args.full_train:
+            raise SystemExit("--kfold and --full-train are mutually exclusive.")
+        if not 0 <= args.fold_idx < args.kfold:
+            raise SystemExit(
+                f"--fold-idx must be in [0,{args.kfold}); got {args.fold_idx}"
+            )
     if args.tta_sizes:
         cfg["tta_sizes"] = [int(s) for s in args.tta_sizes.split(",")]
         print(f"TTA sizes overridden → {cfg['tta_sizes']}")
@@ -1306,6 +1407,12 @@ def main():
         tta_val_eval(model, cfg, best_ckpt, run)
     elif args.tta_val and full_train:
         print("\n--tta-val ignored: no val split in --full-train mode.")
+
+    # K-fold: write leak-free out-of-fold predictions for this held-out fold.
+    if cfg.get("kfold"):
+        oof_path = str(out / f"oof_fold{cfg['fold_idx']}.csv")
+        print(f"\nWriting out-of-fold predictions → {oof_path}")
+        oof_predict_and_save(model, cfg, best_ckpt, oof_path)
 
     elapsed = time.time() - t_start
     h, rem = divmod(int(elapsed), 3600)
