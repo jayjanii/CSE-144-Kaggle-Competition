@@ -50,18 +50,31 @@ def make_grid(images, cols=5, tile_size=224, pad=4, bg=(20, 20, 20)):
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--train-dir", default="data/train")
+    p.add_argument("--train-dir", default=None,
+                   help="Path to train/ folder. If missing, downloads via kagglehub "
+                        "(same path train.py uses).")
     p.add_argument("--out", default="class_grids")
     p.add_argument("--tile-size", type=int, default=224)
     p.add_argument("--cols", type=int, default=5)
     args = p.parse_args()
 
+    # Reuse train.py's downloader so this script Just Works in Colab
+    train_dir = args.train_dir
+    if not train_dir or not os.path.isdir(train_dir) or not os.listdir(train_dir):
+        from train import CONFIG, maybe_download_data
+        cfg = dict(CONFIG)
+        if train_dir:
+            cfg["train_dir"] = train_dir
+        maybe_download_data(cfg)
+        train_dir = cfg["train_dir"]
+    print(f"Using train_dir = {train_dir}")
+
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
 
-    classes = sorted(os.listdir(args.train_dir), key=lambda s: int(s) if s.isdigit() else s)
+    classes = sorted(os.listdir(train_dir), key=lambda s: int(s) if s.isdigit() else s)
     for cls in classes:
-        cls_dir = Path(args.train_dir) / cls
+        cls_dir = Path(train_dir) / cls
         if not cls_dir.is_dir():
             continue
         files = sorted(cls_dir.iterdir())[:10]
