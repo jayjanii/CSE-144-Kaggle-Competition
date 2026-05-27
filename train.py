@@ -104,7 +104,11 @@ def is_dinov2(model_name: str) -> bool:
     return model_name.startswith("dinov2")
 
 
-def build_model(num_classes: int = 100, model_name: str = "dinov2_vitg14_reg") -> nn.Module:
+def build_model(
+    num_classes: int = 100,
+    model_name: str = "dinov2_vitg14_reg",
+    drop_path_rate: float | None = None,
+) -> nn.Module:
     """Build a backbone with a fresh `num_classes` head.
 
     DINOv2 variants load from torch.hub (embed dim 1536 for all ViT-g). Any other
@@ -113,6 +117,10 @@ def build_model(num_classes: int = 100, model_name: str = "dinov2_vitg14_reg") -
     errors. timm handles the classifier head via `num_classes`, and
     `dynamic_img_size=True` lets ViT-style models interpolate their positional
     embeddings so multi-scale TTA works the way it does for DINOv2.
+
+    drop_path_rate: stochastic-depth override for timm models. ConvNeXt-V2-Huge
+    ships with 0.5 which destroys signal at 1000 samples — pass 0.1 (or so) when
+    fine-tuning ConvNeXt on this task. Ignored for DINOv2 (torch.hub).
     """
     if is_dinov2(model_name):
         model = torch.hub.load("facebookresearch/dinov2", model_name)
@@ -124,6 +132,8 @@ def build_model(num_classes: int = 100, model_name: str = "dinov2_vitg14_reg") -
     import timm
 
     base = dict(pretrained=True, num_classes=num_classes)
+    if drop_path_rate is not None:
+        base["drop_path_rate"] = drop_path_rate
     try:
         # ViT / EVA / SigLIP: interpolate pos-embeds for arbitrary input sizes
         model = timm.create_model(model_name, dynamic_img_size=True, **base)
@@ -187,9 +197,8 @@ def enable_grad_checkpointing(model: nn.Module, model_name: str = "dinov2") -> N
 # ── Augmentation ──────────────────────────────────────────────────────────────
 
 
-def get_train_transform(
-    size: int = 448, mean: tuple = DINOV2_MEAN, std: tuple = DINOV2_STD
-) -> A.Compose:
+def _default_train_transform(size: int, mean: tuple, std: tuple) -> A.Compose:
+    """Aggressive ViT recipe — reproduces the DINOv2 0.945 baseline. Keep stable."""
     return A.Compose(
         [
             A.RandomResizedCrop(
@@ -220,6 +229,76 @@ def get_train_transform(
             ToTensorV2(),
         ]
     )
+
+
+def _convnext_train_transform(size: int, mean: tuple, std: tuple) -> A.Compose:
+    """ConvNeXt-tuned recipe — over-regularization is the #1 failure mode for
+    ConvNeXt on small data, so this preset:
+      - Drops the redundant Rotate (ShiftScaleRotate already rotates).
+      - Cuts ColorJitter intensity in half; ToGray near-off.
+      - Replaces dropped color ops with a RandAugment-style OneOf
+        (Equalize/Posterize/Solarize/Sharpen/CLAHE) — these are the transforms
+        the default recipe is missing entirely and they matter at 1000 samples.
+      - Shrinks CoarseDropout coverage but increases minimum hole size so holes
+        actually mask meaningful regions at small input sizes.
+      - Removes GridDistortion (ConvNeXt's locality bias dislikes warping).
+    """
+    return A.Compose(
+        [
+            A.RandomResizedCrop(
+                size=(size, size), scale=(0.5, 1.0), ratio=(0.75, 1.33)
+            ),
+            A.HorizontalFlip(p=0.5),
+            A.ShiftScaleRotate(
+                shift_limit=0.05,
+                scale_limit=0.1,
+                rotate_limit=10,
+                border_mode=0,
+                p=0.4,
+            ),
+            A.OneOf(
+                [
+                    A.Equalize(p=1.0),
+                    A.Posterize(num_bits=(4, 6), p=1.0),
+                    A.Solarize(threshold=128, p=1.0),
+                    A.Sharpen(alpha=(0.2, 0.5), p=1.0),
+                    A.CLAHE(clip_limit=2.0, p=1.0),
+                ],
+                p=0.5,
+            ),
+            A.ColorJitter(
+                brightness=0.2, contrast=0.2, saturation=0.2, hue=0.05, p=0.6
+            ),
+            A.ToGray(p=0.05),
+            A.GaussianBlur(blur_limit=(3, 5), p=0.2),
+            A.GaussNoise(p=0.1),
+            A.CoarseDropout(
+                num_holes_range=(1, 4),
+                hole_height_range=(8, 64),
+                hole_width_range=(8, 64),
+                fill=0,
+                p=0.25,
+            ),
+            A.Normalize(mean=mean, std=std),
+            ToTensorV2(),
+        ]
+    )
+
+
+def get_train_transform(
+    size: int = 448,
+    mean: tuple = DINOV2_MEAN,
+    std: tuple = DINOV2_STD,
+    style: str = "default",
+) -> A.Compose:
+    """Train-time augmentation. `style='default'` reproduces the DINOv2 0.945 baseline.
+    `style='convnext'` is a lighter, RandAugment-flavored recipe for ConvNeXt/SigLIP
+    which both over-regularize under the default."""
+    if style == "convnext":
+        return _convnext_train_transform(size, mean, std)
+    if style != "default":
+        raise ValueError(f"unknown aug style: {style!r}")
+    return _default_train_transform(size, mean, std)
 
 
 def get_val_transform(
@@ -333,7 +412,7 @@ def get_datasets(cfg: dict, full_train: bool = False, pseudo_csv: str | None = N
     size = cfg["input_size"]
     mean = cfg.get("norm_mean", DINOV2_MEAN)
     std = cfg.get("norm_std", DINOV2_STD)
-    train_tf = get_train_transform(size, mean, std)
+    train_tf = get_train_transform(size, mean, std, cfg.get("aug_style", "default"))
     base_ds = _numeric_image_folder(cfg["train_dir"])
     n = len(base_ds)
 
@@ -1037,6 +1116,34 @@ def parse_args():
         "--phase23-batch-size", type=int, default=CONFIG["phase23_batch_size"]
     )
     p.add_argument("--grad-accum-steps", type=int, default=CONFIG["grad_accum_steps"])
+    # augmentation / regularization (per-member tuning)
+    p.add_argument(
+        "--aug-style", default="default", choices=("default", "convnext"),
+        help="Augmentation preset. 'default' = current aggressive ViT recipe "
+             "(reproduces the DINOv2 0.945 baseline — keep for DINOv2/EVA). "
+             "'convnext' = lighter color, RandAugment-flavored ops, smaller drops "
+             "— use for ConvNeXt and likely for SigLIP."
+    )
+    p.add_argument(
+        "--mixup-alpha", type=float, default=CONFIG["mixup_alpha"],
+        help="MixUp alpha (CONFIG=0.4). Standard DeiT/ConvNeXt fine-tune uses 0.8."
+    )
+    p.add_argument(
+        "--cutmix-alpha", type=float, default=CONFIG["cutmix_alpha"],
+        help="CutMix alpha (CONFIG=0.2). Standard is 1.0 — anything <0.5 is mostly no-op."
+    )
+    p.add_argument(
+        "--mix-prob", type=float, default=CONFIG["mixup_cutmix_prob"],
+        help="Probability of applying MixUp/CutMix per batch (CONFIG=0.5). "
+             "ConvNeXt fine-tuning typically wants ~0.25 — combined with the lighter "
+             "convnext aug preset this avoids over-regularization at 1000 samples."
+    )
+    p.add_argument(
+        "--drop-path-rate", type=float, default=None,
+        help="Stochastic-depth rate for timm models. Required for ConvNeXt-V2 "
+             "(ships with 0.5 which destroys signal at 1000 samples; use 0.1). "
+             "Leave unset for DINOv2/EVA/SigLIP."
+    )
     # checkpointing
     p.add_argument(
         "--save-optimizer",
@@ -1075,6 +1182,11 @@ def main():
             "pseudo_labels": args.pseudo_labels,
             "kfold": args.kfold,
             "fold_idx": args.fold_idx,
+            "aug_style": args.aug_style,
+            "mixup_alpha": args.mixup_alpha,
+            "cutmix_alpha": args.cutmix_alpha,
+            "mixup_cutmix_prob": args.mix_prob,
+            "drop_path_rate": args.drop_path_rate,
         }
     )
     if args.kfold:
@@ -1107,7 +1219,20 @@ def main():
     maybe_download_data(cfg)
 
     print(f"Building model {cfg['model_name']} @ {cfg['input_size']}px...")
-    model = build_model(cfg["num_classes"], cfg["model_name"])
+    model = build_model(
+        cfg["num_classes"], cfg["model_name"], cfg.get("drop_path_rate")
+    )
+    if cfg.get("aug_style") != "default":
+        print(f"Aug preset: {cfg['aug_style']} (lighter than default)")
+    if cfg.get("drop_path_rate") is not None:
+        print(f"drop_path_rate: {cfg['drop_path_rate']}")
+    if (cfg["mixup_alpha"], cfg["cutmix_alpha"], cfg["mixup_cutmix_prob"]) != (
+        CONFIG["mixup_alpha"], CONFIG["cutmix_alpha"], CONFIG["mixup_cutmix_prob"]
+    ):
+        print(
+            f"Mix: mixup_alpha={cfg['mixup_alpha']} cutmix_alpha={cfg['cutmix_alpha']} "
+            f"prob={cfg['mixup_cutmix_prob']}"
+        )
     cfg["norm_mean"], cfg["norm_std"] = resolve_normalization(model, cfg["model_name"])
     print(f"Normalization: mean={cfg['norm_mean']} std={cfg['norm_std']}")
 
