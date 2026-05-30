@@ -43,26 +43,40 @@ import torch
 from PIL import Image
 
 
+def _norm(s):
+    """Canonicalize a class name so format differences (case, spaces, _, -, .)
+    don't break matching. 'Cadillac_CTS-V_Sedan_2012' and
+    'cadillac cts-v sedan 2012' both -> 'cadillacctsvsedan2012'."""
+    return "".join(c for c in s.lower() if c.isalnum())
+
+
 @torch.inference_mode()
 def encode_folder(model, preprocess, folder, device, batch_size=32, label_map=None):
     """Return (features[N,D] L2-normalized, labels[N], paths[N]).
 
     Walks `folder/<class>/*` ImageFolder-style. `label_map[class_name]` gives
-    the local 0-99 id; rows with no mapping are skipped.
+    the local 0-99 id; rows with no mapping are skipped. Matching is done on a
+    normalized form so case/separator differences between the mapping CSV and
+    the on-disk folder names don't silently drop classes.
     """
+    norm_map = {_norm(k): v for k, v in label_map.items()} if label_map else None
     files, labels = [], []
+    unmatched = []
     for cls_dir in sorted(Path(folder).iterdir()):
         if not cls_dir.is_dir():
             continue
         cls = cls_dir.name
-        if label_map is not None and cls not in label_map:
+        if norm_map is not None and _norm(cls) not in norm_map:
+            unmatched.append(cls)
             continue
-        lab = label_map[cls] if label_map else -1
+        lab = norm_map[_norm(cls)] if norm_map else -1
         for p in sorted(cls_dir.iterdir()):
             if p.suffix.lower() in (".jpg", ".jpeg", ".png"):
                 files.append(str(p))
                 labels.append(lab)
     print(f"  found {len(files)} images across {len(set(labels))} mapped classes")
+    if unmatched:
+        print(f"  ({len(unmatched)} unmapped folders, e.g. {unmatched[:3]})")
 
     feats = []
     for i in range(0, len(files), batch_size):
