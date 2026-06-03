@@ -202,31 +202,7 @@ def main():
         print(f"Encoding {len(te_paths)} test images...")
         Xte = encode(model, mean, std, te_paths, size); np.save(te_cache, Xte)
 
-    # ── held-out validation report (for the presentation) ──
-    Xa, Xb, ya, yb = train_test_split(Xtr, ytr, test_size=0.2,
-                                      random_state=SEED, stratify=ytr)
-    val_clf = LogisticRegression(C=args.C, max_iter=2000, class_weight="balanced", n_jobs=-1)
-    val_clf.fit(Xa, ya)
-    print(f"\nHeld-out 20% val: probe acc {val_clf.score(Xb, yb):.4f}")
-
-    # leak-free OOF accuracy over all train (CV)
-    skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=SEED)
-    oof = np.zeros(len(ytr))
-    for tr, va in skf.split(Xtr, ytr):
-        c = LogisticRegression(C=args.C, max_iter=2000, class_weight="balanced", n_jobs=-1)
-        c.fit(Xtr[tr], ytr[tr]); oof[va] = c.predict(Xtr[va])
-    print(f"5-fold OOF: probe acc {(oof == ytr).mean():.4f}")
-
-    # ── 2. PROBE (fit on all train, predict test) ──
-    print("\nFitting final probe on all train...")
-    clf = LogisticRegression(C=args.C, max_iter=2000, class_weight="balanced", n_jobs=-1)
-    clf.fit(Xtr, ytr)
-    P = np.zeros((len(te_paths), C))
-    pr = clf.predict_proba(Xte)
-    for j, cls in enumerate(clf.classes_):
-        P[:, cls] = pr[:, j]
-
-    # ── 3. ZERO-SHOT text ──
+    # ── 3. ZERO-SHOT text features (needed for both train-OOF eval and test) ──
     names = load_names(args.names, C)
     templates = [t.strip() for t in args.templates.split(",")]
     with torch.inference_mode():
@@ -239,12 +215,56 @@ def main():
             feats.append(F.normalize(tf_, dim=0))
         known = F.normalize(torch.stack([t for t in feats if t is not None]).mean(0), dim=0)
         feats = torch.stack([t if t is not None else known for t in feats])
-        Z = ((torch.tensor(Xte).to(DEVICE) @ feats.T) * scale).softmax(1).cpu().numpy()
+
+        def zeroshot(X):
+            return ((torch.tensor(X).to(DEVICE) @ feats.T) * scale).softmax(1).cpu().numpy()
+
+        Z = zeroshot(Xte)        # test
+        Ztr = zeroshot(Xtr)      # train (for fused-OOF eval)
+
+    # ── held-out validation report (probe only) ──
+    Xa, Xb, ya, yb = train_test_split(Xtr, ytr, test_size=0.2,
+                                      random_state=SEED, stratify=ytr)
+    val_clf = LogisticRegression(C=args.C, max_iter=2000, class_weight="balanced", n_jobs=-1)
+    val_clf.fit(Xa, ya)
+    print(f"\nHeld-out 20% val: probe acc {val_clf.score(Xb, yb):.4f}")
+
+    # ── leak-free OOF: probe-only AND fused (the real comparison number) ──
+    skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=SEED)
+    oof_P = np.zeros((len(ytr), C))
+    for tr, va in skf.split(Xtr, ytr):
+        c = LogisticRegression(C=args.C, max_iter=2000, class_weight="balanced", n_jobs=-1)
+        c.fit(Xtr[tr], ytr[tr])
+        pr = c.predict_proba(Xtr[va])
+        for j, cls in enumerate(c.classes_):
+            oof_P[va, cls] = pr[:, j]
+    probe_oof = (oof_P.argmax(1) == ytr).mean()
+    oof_fused = args.alpha * oof_P + (1 - args.alpha) * Ztr
+    fused_oof = (oof_fused.argmax(1) == ytr).mean()
+    zs_oof = (Ztr.argmax(1) == ytr).mean()
+    print(f"5-fold OOF: probe={probe_oof:.4f}  zero-shot={zs_oof:.4f}  "
+          f"FUSED={fused_oof:.4f}  (alpha={args.alpha})")
+    # quick alpha sweep on OOF so you can pick the best fusion weight
+    best_a, best_acc = args.alpha, fused_oof
+    for a in (0.4, 0.5, 0.55, 0.6, 0.65, 0.7, 0.75, 0.8):
+        acc = ((a * oof_P + (1 - a) * Ztr).argmax(1) == ytr).mean()
+        if acc > best_acc:
+            best_a, best_acc = a, acc
+    print(f"  best alpha on OOF: {best_a} -> {best_acc:.4f}")
+
+    # ── 2. PROBE (fit on all train, predict test) ──
+    print("\nFitting final probe on all train...")
+    clf = LogisticRegression(C=args.C, max_iter=2000, class_weight="balanced", n_jobs=-1)
+    clf.fit(Xtr, ytr)
+    P = np.zeros((len(te_paths), C))
+    pr = clf.predict_proba(Xte)
+    for j, cls in enumerate(clf.classes_):
+        P[:, cls] = pr[:, j]
 
     # ── 4. FUSE ──
     fused = args.alpha * P + (1 - args.alpha) * Z
     fused = fused / fused.sum(1, keepdims=True)
-    print(f"\nFused 0.{int(args.alpha*100)}*P + 0.{int((1-args.alpha)*100)}*Z")
+    print(f"\nFused {args.alpha}*P + {1-args.alpha:.2f}*Z")
 
     # ── 5. BALANCE ──
     if args.sinkhorn:
