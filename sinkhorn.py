@@ -51,12 +51,12 @@ def sinkhorn_balance(P, col_target, n_iters=100, tau=1.0, eps=1e-12):
     M = np.exp(logP)  # [N, C]
 
     N, C = M.shape
-    r = np.ones(N)                 # each image gets total mass 1 (one label)
-    c = np.full(C, col_target)     # each class gets ~N/C predictions
+    r = np.ones((N, 1))            # each image gets total mass 1 (one label)
+    c = np.full((1, C), col_target)  # each class gets ~N/C predictions
 
     for _ in range(n_iters):
         # scale columns to hit the class marginal
-        M *= (c / (M.sum(axis=0) + eps))
+        M *= (c / (M.sum(axis=0, keepdims=True) + eps))
         # scale rows back to unit mass per image
         M *= (r / (M.sum(axis=1, keepdims=True) + eps))
     return M
