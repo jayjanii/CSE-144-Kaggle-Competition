@@ -43,7 +43,7 @@ def main():
     p.add_argument("--train-dir", default=None)
     p.add_argument("--num-classes", type=int, default=100)
     p.add_argument("--iters", type=int, default=60)
-    p.add_argument("--lr", type=float, default=0.5)
+    p.add_argument("--lr", type=float, default=1.0)
     p.add_argument("--weight-decay", type=float, default=1e-3,
                    help="L2 (mirrors the probe's regularization)")
     p.add_argument("--out", default="probe_curve.png")
@@ -75,13 +75,24 @@ def main():
     crit_plain = nn.CrossEntropyLoss()
 
     clf = nn.Linear(X.shape[1], args.num_classes)
-    opt = torch.optim.Adam(clf.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    # LBFGS: full-batch quasi-Newton — smooth, monotonic convergence for a
+    # small linear probe (matches the clean shape of a logistic-probe curve).
+    opt = torch.optim.LBFGS(clf.parameters(), lr=args.lr, max_iter=1,
+                            history_size=10, line_search_fn="strong_wolfe")
+    wd = args.weight_decay
+
+    def closure():
+        opt.zero_grad()
+        loss = crit(clf(Xtr_t), ytr_t)
+        if wd:
+            loss = loss + wd * sum((p ** 2).sum() for p in clf.parameters())
+        loss.backward()
+        return loss
 
     tr_losses, va_losses = [], []
     for it in range(args.iters):
-        clf.train(); opt.zero_grad()
-        loss = crit(clf(Xtr_t), ytr_t)
-        loss.backward(); opt.step()
+        clf.train()
+        opt.step(closure)
         clf.eval()
         with torch.no_grad():
             tr = crit_plain(clf(Xtr_t), ytr_t).item()
