@@ -209,16 +209,12 @@ def _tta_transforms(size, mean, std):
 
 
 @torch.inference_mode()
-def predict_test(model, test_dir, size, mean, std, batch_size=32):
+def predict_pils(model, imgs, size, mean, std, num_classes=100, batch_size=32):
+    """4-view TTA softmax over a list of RGB numpy images -> (n, C) probs."""
     model.eval()
-    fnames = sorted(
-        [f for f in os.listdir(test_dir) if f.lower().endswith((".jpg", ".jpeg", ".png"))],
-        key=lambda f: int(os.path.splitext(f)[0]),
-    )
     views = _tta_transforms(size, mean, std)
-    n, C = len(fnames), 100
-    probs = np.zeros((n, C), dtype=np.float64)
-    imgs = [np.array(Image.open(os.path.join(test_dir, f)).convert("RGB")) for f in fnames]
+    n = len(imgs)
+    probs = np.zeros((n, num_classes), dtype=np.float64)
     for tf in views:
         for i in range(0, n, batch_size):
             chunk = imgs[i:i + batch_size]
@@ -227,6 +223,20 @@ def predict_test(model, test_dir, size, mean, std, batch_size=32):
                 p = model(xb).softmax(1).float().cpu().numpy()
             probs[i:i + len(chunk)] += p
     probs /= len(views)
+    return probs
+
+
+def list_test_fnames(test_dir):
+    return sorted(
+        [f for f in os.listdir(test_dir) if f.lower().endswith((".jpg", ".jpeg", ".png"))],
+        key=lambda f: int(os.path.splitext(f)[0]),
+    )
+
+
+def predict_test(model, test_dir, size, mean, std, num_classes=100, batch_size=32):
+    fnames = list_test_fnames(test_dir)
+    imgs = [np.array(Image.open(os.path.join(test_dir, f)).convert("RGB")) for f in fnames]
+    probs = predict_pils(model, imgs, size, mean, std, num_classes, batch_size)
     return fnames, probs
 
 
@@ -257,6 +267,11 @@ def parse_args():
     p.add_argument("--cutmix-alpha", type=float, default=1.0)
     p.add_argument("--mix-prob", type=float, default=0.5)
     p.add_argument("--grad-clip", type=float, default=1.0)
+    p.add_argument("--folds", type=int, default=None,
+                   help="K-fold bagging: train K models on K stratified folds, "
+                        "average their test probs, and emit a leak-free OOF matrix "
+                        "(every image predicted by a model that never saw it). "
+                        "Uses 100%% of the data. Omit for a single 85/15 split + curve.")
     p.add_argument("--val-frac", type=float, default=0.15)
     p.add_argument("--grad-checkpointing", action="store_true")
     p.add_argument("--num-classes", type=int, default=100)
@@ -265,6 +280,167 @@ def parse_args():
     p.add_argument("--out", default="ft_so400m")
     p.add_argument("--seed", type=int, default=42)
     return p.parse_args()
+
+
+def make_model_and_norm(args):
+    """Build a fresh backbone, partially unfreeze it, return (model, mean, std, unfrozen)."""
+    model = build_model(args.num_classes, args.model, args.drop_path_rate)
+    mean, std = resolve_normalization(model, args.model)
+    unfrozen = partial_unfreeze(model, args.model, args.unfreeze_blocks)
+    if args.grad_checkpointing:
+        enable_grad_checkpointing(model, args.model)
+    return model, mean, std, unfrozen
+
+
+def train_fold(args, cfg, base, tr_idx, va_idx, tag="", select_best=False):
+    """Train one model on tr_idx, tracking metrics on va_idx.
+
+    select_best=True keeps the best-val checkpoint (single-split curve mode).
+    select_best=False keeps the FINAL-epoch weights — required for honest OOF in
+    k-fold mode (selecting on the held-out fold you then score would leak).
+    Returns (model, mean, std, hist).
+    """
+    model, mean, std, unfrozen = make_model_and_norm(args)
+    train_tf = get_train_transform(args.input_size, mean, std, args.aug_style)
+    eval_tf = get_val_transform(args.input_size, mean, std)
+    train_ds = AlbumentationsDataset(Subset(base, tr_idx), train_tf)
+    train_eval_ds = AlbumentationsDataset(Subset(base, tr_idx), eval_tf)
+    val_ds = AlbumentationsDataset(Subset(base, va_idx), eval_tf)
+
+    dl_kw = dict(num_workers=4, pin_memory=True, persistent_workers=True)
+    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, **dl_kw)
+    train_eval_loader = DataLoader(train_eval_ds, batch_size=args.batch_size, **dl_kw)
+    val_loader = DataLoader(val_ds, batch_size=args.batch_size, **dl_kw)
+
+    criterion = LabelSmoothingCE(args.label_smoothing)
+    optimizer = build_optimizer(model, args.model, unfrozen, args.head_lr,
+                                args.backbone_lr, args.llrd_decay, args.weight_decay)
+    steps = args.epochs * len(train_loader)
+    warmup = int(args.warmup_frac * steps)
+    from transformers import get_cosine_schedule_with_warmup
+    scheduler = get_cosine_schedule_with_warmup(optimizer, warmup, steps)
+    scaler = torch.amp.GradScaler(DEVICE)
+
+    hist = {"tr_loss": [], "va_loss": [], "tr_acc": [], "va_acc": []}
+    best_acc, best_sd = 0.0, None
+    print(f"\nTraining {args.epochs} epochs {tag}...")
+    for ep in range(args.epochs):
+        t0 = time.time()
+        train_one_epoch(model, train_loader, criterion, optimizer, scaler, scheduler, cfg)
+        tr_loss, tr_acc = evaluate(model, train_eval_loader)
+        va_loss, va_acc = evaluate(model, val_loader)
+        hist["tr_loss"].append(tr_loss); hist["va_loss"].append(va_loss)
+        hist["tr_acc"].append(tr_acc); hist["va_acc"].append(va_acc)
+        star = " "
+        if va_acc > best_acc:
+            best_acc = va_acc
+            if select_best:
+                best_sd = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+            star = "*"
+        print(f"[E{ep:02d}] tr_loss={tr_loss:.3f} va_loss={va_loss:.3f} "
+              f"tr_acc={tr_acc:.4f} va_acc={va_acc:.4f} {star} {time.time()-t0:.0f}s")
+
+    if select_best and best_sd is not None:
+        model.load_state_dict(best_sd)
+        print(f"Loaded best-val weights ({best_acc:.4f}).")
+    else:
+        print(f"Keeping final-epoch weights (best seen {best_acc:.4f}).")
+    return model, mean, std, hist
+
+
+def _write_test_outputs(out, fnames, probs, num_classes):
+    np.save(str(out / "test_probs.npy"), probs)
+    with open(out / "submission_probs.csv", "w", newline="") as f:
+        w = csv.writer(f); w.writerow(["image_id"] + [str(c) for c in range(num_classes)])
+        for fn, row in zip(fnames, probs):
+            w.writerow([fn] + [f"{v:.6f}" for v in row])
+    with open(out / "submission.csv", "w", newline="") as f:
+        w = csv.writer(f); w.writerow(["id", "label"])
+        for fn, row in zip(fnames, probs):
+            w.writerow([os.path.splitext(fn)[0], int(row.argmax())])
+    print(f"Wrote {out/'submission_probs.csv'}, {out/'submission.csv'}, {out/'test_probs.npy'}")
+
+
+def run_single(args, cfg, base, test_dir, out):
+    """85/15 stratified split: train one model, draw the curve, predict test."""
+    targets = np.array(base.targets)
+    sss = StratifiedShuffleSplit(n_splits=1, test_size=args.val_frac, random_state=args.seed)
+    tr_idx, va_idx = next(sss.split(np.zeros(len(targets)), targets))
+    print(f"Single split: {len(tr_idx)} train / {len(va_idx)} val (stratified)")
+
+    model, mean, std, hist = train_fold(args, cfg, base, tr_idx, va_idx, select_best=True)
+    print(f"\nBest val acc: {max(hist['va_acc']):.4f}  (vs frozen probe ~0.945 OOF / 0.972 LB)")
+
+    curve = str(out / "curve.png")
+    make_paper_figure(hist, args.epochs, curve)
+    print(f"Wrote {curve} (+ .pdf)")
+
+    print("Predicting test set with 4-view TTA ...")
+    fnames, probs = predict_test(model, test_dir, args.input_size, mean, std,
+                                 args.num_classes, args.batch_size)
+    _write_test_outputs(out, fnames, probs, args.num_classes)
+
+
+def run_kfold(args, cfg, base, test_dir, out):
+    """K-fold bagging: K models on K stratified folds -> leak-free OOF + bagged test."""
+    from train import _fold_assignment
+
+    targets = np.array(base.targets)
+    N, C, K = len(targets), args.num_classes, args.folds
+    fold_of = _fold_assignment(base.targets, K, args.seed)
+
+    fnames = list_test_fnames(test_dir)
+    test_imgs = [np.array(Image.open(os.path.join(test_dir, f)).convert("RGB")) for f in fnames]
+    test_accum = np.zeros((len(fnames), C), dtype=np.float64)
+    oof = np.zeros((N, C), dtype=np.float64)
+    hist0 = None
+
+    for f in range(K):
+        va_idx = np.where(fold_of == f)[0]
+        tr_idx = np.where(fold_of != f)[0]
+        print(f"\n=== Fold {f}/{K}: {len(tr_idx)} train / {len(va_idx)} held-out ===")
+        model, mean, std, hist = train_fold(
+            args, cfg, base, tr_idx, va_idx, tag=f"[fold {f}] ", select_best=False)
+        if f == 0:
+            hist0 = hist  # representative curve
+
+        # leak-free OOF: predict this fold's held-out images with its own model
+        va_imgs = [np.array(base[i][0].convert("RGB")) for i in va_idx]
+        oof[va_idx] = predict_pils(model, va_imgs, args.input_size, mean, std, C, args.batch_size)
+        fold_oof_acc = (oof[va_idx].argmax(1) == targets[va_idx]).mean()
+        print(f"  fold {f} held-out TTA acc: {fold_oof_acc:.4f}")
+
+        # bagged test prediction
+        test_accum += predict_pils(model, test_imgs, args.input_size, mean, std, C, args.batch_size)
+
+        del model
+        torch.cuda.empty_cache()
+
+    oof_acc = (oof.argmax(1) == targets).mean()
+    print(f"\n=== Bagged OOF acc ({K} folds, 4-view TTA): {oof_acc:.4f} "
+          f"over {N} images (vs frozen probe ~0.945 OOF) ===")
+
+    # paper curve from fold 0
+    if hist0 is not None:
+        curve = str(out / "curve.png")
+        make_paper_figure(hist0, args.epochs, curve)
+        print(f"Wrote {curve} (+ .pdf)  [fold-0 curve]")
+
+    # ── OOF outputs in canonical (class, filename) order so they align with the
+    #    probe pipeline's OOF for fusion ──
+    order = sorted(range(N), key=lambda i: (int(targets[i]), base.samples[i][0]))
+    oof_canon = oof[order]
+    np.save(str(out / "oof_probs.npy"), oof_canon)
+    with open(out / "oof_probs.csv", "w", newline="") as fcsv:
+        w = csv.writer(fcsv); w.writerow(["path", "label"] + [str(c) for c in range(C)])
+        for i in order:
+            w.writerow([base.samples[i][0], int(targets[i])]
+                       + [f"{v:.6f}" for v in oof[i]])
+    print(f"Wrote {out/'oof_probs.npy'} (+ .csv) — canonical order for fusion")
+
+    # ── bagged test outputs ──
+    test_probs = test_accum / K
+    _write_test_outputs(out, fnames, test_probs, C)
 
 
 def main():
@@ -283,107 +459,44 @@ def main():
         train_dir = train_dir or cfg0["train_dir"]
         test_dir = test_dir or cfg0["test_dir"]
 
-    print(f"Building {args.model} @ {args.input_size}px ...")
-    model = build_model(args.num_classes, args.model, args.drop_path_rate)
-    mean, std = resolve_normalization(model, args.model)
-    print(f"Normalization: mean={mean} std={std}")
-    unfrozen = partial_unfreeze(model, args.model, args.unfreeze_blocks)
-    if args.grad_checkpointing:
-        enable_grad_checkpointing(model, args.model)
-
+    print(f"Backbone {args.model} @ {args.input_size}px, unfreeze last "
+          f"{args.unfreeze_blocks} blocks, aug={args.aug_style}")
     cfg = {
         "grad_clip": args.grad_clip,
         "mixup_alpha": args.mixup_alpha,
         "cutmix_alpha": args.cutmix_alpha,
         "mixup_cutmix_prob": args.mix_prob,
     }
-
-    # ── stratified train/val split for the curve ──
     base = _numeric_image_folder(train_dir)
-    targets = np.array(base.targets)
-    sss = StratifiedShuffleSplit(n_splits=1, test_size=args.val_frac, random_state=args.seed)
-    tr_idx, va_idx = next(sss.split(np.zeros(len(targets)), targets))
-    print(f"Split: {len(tr_idx)} train / {len(va_idx)} val (stratified)")
 
-    train_tf = get_train_transform(args.input_size, mean, std, args.aug_style)
-    eval_tf = get_val_transform(args.input_size, mean, std)
-    train_ds = AlbumentationsDataset(Subset(base, tr_idx), train_tf)
-    train_eval_ds = AlbumentationsDataset(Subset(base, tr_idx), eval_tf)  # clean metrics
-    val_ds = AlbumentationsDataset(Subset(base, va_idx), eval_tf)
-
-    dl_kw = dict(num_workers=4, pin_memory=True, persistent_workers=True)
-    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, **dl_kw)
-    train_eval_loader = DataLoader(train_eval_ds, batch_size=args.batch_size, **dl_kw)
-    val_loader = DataLoader(val_ds, batch_size=args.batch_size, **dl_kw)
-
-    criterion = LabelSmoothingCE(args.label_smoothing)
-    optimizer = build_optimizer(model, args.model, unfrozen, args.head_lr,
-                                args.backbone_lr, args.llrd_decay, args.weight_decay)
-    steps = args.epochs * len(train_loader)
-    warmup = int(args.warmup_frac * steps)
-    from transformers import get_cosine_schedule_with_warmup
-    scheduler = get_cosine_schedule_with_warmup(optimizer, warmup, steps)
-    scaler = torch.amp.GradScaler(DEVICE)
-
-    hist = {"tr_loss": [], "va_loss": [], "tr_acc": [], "va_acc": []}
-    best_acc, best_path = 0.0, str(out / "best.pth")
-    print(f"\nTraining {args.epochs} epochs ...")
-    for ep in range(args.epochs):
-        t0 = time.time()
-        train_one_epoch(model, train_loader, criterion, optimizer, scaler, scheduler, cfg)
-        tr_loss, tr_acc = evaluate(model, train_eval_loader)
-        va_loss, va_acc = evaluate(model, val_loader)
-        hist["tr_loss"].append(tr_loss); hist["va_loss"].append(va_loss)
-        hist["tr_acc"].append(tr_acc); hist["va_acc"].append(va_acc)
-        if va_acc > best_acc:
-            best_acc = va_acc
-            torch.save({"model": model.state_dict(), "val_acc": va_acc}, best_path)
-        print(f"[E{ep:02d}] tr_loss={tr_loss:.3f} va_loss={va_loss:.3f} "
-              f"tr_acc={tr_acc:.4f} va_acc={va_acc:.4f} "
-              f"{'*' if va_acc == best_acc else ' '} {time.time()-t0:.0f}s")
-
-    print(f"\nBest val acc: {best_acc:.4f}  (vs frozen probe ~0.945 OOF / 0.972 LB)")
-
-    # ── paper-style curve ──
-    curve = str(out / "curve.png")
-    make_paper_figure(hist, args.epochs, curve)
-    print(f"Wrote {curve} (+ .pdf)")
-
-    # ── reload best, predict test with TTA, export probs ──
-    model.load_state_dict(torch.load(best_path, map_location=DEVICE)["model"])
-    print("Predicting test set with 4-view TTA ...")
-    fnames, probs = predict_test(model, test_dir, args.input_size, mean, std,
-                                 batch_size=args.batch_size)
-
-    np.save(str(out / "test_probs.npy"), probs)
-    with open(out / "submission_probs.csv", "w", newline="") as f:
-        w = csv.writer(f); w.writerow(["image_id"] + [str(c) for c in range(args.num_classes)])
-        for fn, row in zip(fnames, probs):
-            w.writerow([fn] + [f"{v:.6f}" for v in row])
-    with open(out / "submission.csv", "w", newline="") as f:
-        w = csv.writer(f); w.writerow(["id", "label"])
-        for fn, row in zip(fnames, probs):
-            w.writerow([os.path.splitext(fn)[0], int(row.argmax())])
-    print(f"Wrote {out/'submission_probs.csv'}, {out/'submission.csv'}, "
-          f"{out/'test_probs.npy'}")
-    print("\nTo fuse with the probe pipeline, average the two test-prob matrices "
-          "(see the snippet at the bottom of this file).")
+    if args.folds and args.folds > 1:
+        run_kfold(args, cfg, base, test_dir, out)
+    else:
+        run_single(args, cfg, base, test_dir, out)
 
 
 # ── Fusing with the frozen-probe pipeline ─────────────────────────────────────
-# After siglip2_pipeline.py has written the probe's per-image test probs and this
-# script has written ft_so400m/test_probs.npy (rows aligned to the SAME sorted
-# test filenames), fuse with a single weight w and pick the argmax:
+# K-fold mode emits two aligned matrices you need for an honest fusion:
+#   <out>/oof_probs.npy   leak-free OOF over all 1079 train images (canonical
+#                         (class, filename) order)
+#   <out>/test_probs.npy  bagged test probs (sorted test filenames)
 #
-#   import numpy as np, csv, os
-#   P_probe = np.load("probe_test_probs.npy")     # frozen probe+text, normalized
-#   P_ft    = np.load("ft_so400m/test_probs.npy") # this fine-tune
-#   for w in [0.0, 0.1, 0.2, 0.3, 0.4, 0.5]:      # sweep on your OOF, not the LB
-#       fused = (1 - w) * P_probe + w * P_ft
-#       # ...write submission, evaluate on OOF...
+# Tune the fuse weight on OOF (never the public LB), then apply the SAME weight
+# to the test probs:
 #
-# The fine-tune is weaker alone, so the best w is usually small (0.15–0.30); its
-# job is to break ties the probe gets wrong. Validate w on OOF, never on the LB.
+#   import numpy as np
+#   Q_oof = np.load("ft_so400m/oof_probs.npy")     # this fine-tune, OOF
+#   P_oof = np.load("probe_oof_probs.npy")         # frozen probe+text, OOF (canonical order)
+#   y     = np.load("oof_labels.npy")              # canonical-order labels
+#   best_w, best_acc = 0.0, (P_oof.argmax(1) == y).mean()
+#   for w in np.linspace(0, 0.6, 13):
+#       acc = ((1 - w) * P_oof + w * Q_oof).argmax(1) == y
+#       if acc.mean() > best_acc: best_w, best_acc = w, acc.mean()
+#   print("best w", best_w, "OOF acc", best_acc)   # apply best_w to the test probs
+#
+# The fine-tune is weaker alone, so the winning w is usually small (0.15–0.30):
+# its job is to break ties the probe gets wrong. If best_w == 0, it adds nothing
+# and you ship the probe alone — that's a valid, honest outcome.
 
 if __name__ == "__main__":
     main()
