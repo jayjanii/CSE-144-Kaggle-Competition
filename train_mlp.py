@@ -119,6 +119,79 @@ def predict(model, X):
     return model(xb).softmax(1).cpu().numpy()
 
 
+def make_paper_figure(hist, epochs, out):
+    """Two-panel publication-style figure (loss | accuracy)."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    from matplotlib.ticker import MultipleLocator
+
+    # ---- publication rcParams ----
+    plt.rcParams.update({
+        "font.family": "serif",
+        "font.serif": ["DejaVu Serif", "Times New Roman", "Times"],
+        "mathtext.fontset": "dejavuserif",
+        "font.size": 12,
+        "axes.titlesize": 13,
+        "axes.labelsize": 12,
+        "xtick.labelsize": 10.5,
+        "ytick.labelsize": 10.5,
+        "legend.fontsize": 11,
+        "axes.linewidth": 0.9,
+        "xtick.direction": "in",
+        "ytick.direction": "in",
+        "xtick.major.size": 4,
+        "ytick.major.size": 4,
+        "xtick.minor.size": 2.2,
+        "ytick.minor.size": 2.2,
+        "figure.dpi": 150,
+    })
+    TRAIN = "#2C3E70"   # deep slate blue
+    VAL = "#C0504D"     # muted brick red
+    GRID = "#B8B8B8"
+
+    ep = np.arange(1, epochs + 1)
+    fig, (a1, a2) = plt.subplots(1, 2, figsize=(11.5, 4.4))
+
+    # best epoch marker (min val loss)
+    best = int(np.argmin(hist["va_loss"]))
+
+    # ---- loss panel ----
+    a1.plot(ep, hist["tr_loss"], color=TRAIN, lw=1.8, label="Train")
+    a1.plot(ep, hist["va_loss"], color=VAL, lw=1.8, label="Validation")
+    a1.axvline(best + 1, color="0.45", lw=0.9, ls=(0, (4, 3)), zorder=0)
+    a1.set_xlabel("Epoch"); a1.set_ylabel("Cross-entropy loss")
+    a1.set_title("(a)  Loss", loc="left", fontweight="bold")
+    a1.legend(frameon=False, handlelength=1.6)
+
+    # ---- accuracy panel ----
+    a2.plot(ep, np.array(hist["tr_acc"]) * 100, color=TRAIN, lw=1.8, label="Train")
+    a2.plot(ep, np.array(hist["va_acc"]) * 100, color=VAL, lw=1.8, label="Validation")
+    a2.axvline(best + 1, color="0.45", lw=0.9, ls=(0, (4, 3)), zorder=0)
+    a2.set_xlabel("Epoch"); a2.set_ylabel("Accuracy (%)")
+    a2.set_title("(b)  Accuracy", loc="left", fontweight="bold")
+    a2.legend(frameon=False, loc="lower right", handlelength=1.6)
+    # annotate best val accuracy
+    bva = hist["va_acc"][best] * 100
+    a2.annotate(f"{bva:.1f}%", xy=(best + 1, bva),
+                xytext=(best + 1 + epochs * 0.04, bva - 6),
+                fontsize=10, color=VAL,
+                arrowprops=dict(arrowstyle="-", color=VAL, lw=0.8))
+
+    for ax in (a1, a2):
+        ax.set_xlim(1, epochs)
+        ax.grid(True, which="major", color=GRID, lw=0.5, alpha=0.5)
+        ax.xaxis.set_minor_locator(MultipleLocator(max(1, epochs // 20)))
+        for sp in ("top", "right"):
+            ax.spines[sp].set_visible(False)
+        ax.tick_params(which="both", top=False, right=False)
+
+    fig.tight_layout(w_pad=2.5)
+    fig.savefig(out, dpi=300, bbox_inches="tight")
+    # also a vector PDF — what papers actually embed
+    fig.savefig(out.replace(".png", ".pdf"), bbox_inches="tight")
+
+
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     p.add_argument("--emb-train", required=True)
@@ -154,27 +227,8 @@ def main():
     Xtr, Xva, ytr, yva = train_test_split(X, y, test_size=0.2, random_state=SEED, stratify=y)
     _, hist = train_loop(Xtr, ytr, Xva, yva, C, args, log=True)
 
-    import matplotlib
-    matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
-    ep = np.arange(1, args.epochs + 1)
-    fig, (a1, a2) = plt.subplots(1, 2, figsize=(13, 5))
-    a1.plot(ep, hist["tr_loss"], color="#1E2761", lw=2.4, label="training loss")
-    a1.plot(ep, hist["va_loss"], color="#E0A23B", lw=2.4, label="validation loss (held-out 20%)")
-    a1.set_xlabel("epoch"); a1.set_ylabel("cross-entropy loss")
-    a1.set_title("MLP head — loss", fontweight="bold", color="#1E2761")
-    a1.legend(frameon=False); a1.grid(alpha=0.25); a1.set_xlim(1, args.epochs)
-    a2.plot(ep, hist["tr_acc"], color="#1E2761", lw=2.4, label="training accuracy")
-    a2.plot(ep, hist["va_acc"], color="#E0A23B", lw=2.4, label="validation accuracy")
-    a2.set_xlabel("epoch"); a2.set_ylabel("accuracy")
-    a2.set_title("MLP head — accuracy", fontweight="bold", color="#1E2761")
-    a2.legend(frameon=False, loc="lower right"); a2.grid(alpha=0.25); a2.set_xlim(1, args.epochs)
-    for ax in (a1, a2):
-        for sp in ("top", "right"):
-            ax.spines[sp].set_visible(False)
-    fig.tight_layout()
     curve = f"{args.out}_curve.png"
-    fig.savefig(curve, dpi=150)
+    make_paper_figure(hist, args.epochs, curve)
     print(f"Wrote {curve}  (final val_acc {hist['va_acc'][-1]:.4f})")
 
     # ---- 2) leak-free OOF accuracy (5-fold) ----
