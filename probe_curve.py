@@ -42,10 +42,10 @@ def main():
     p.add_argument("--emb", required=True, help="cached train embeddings .npy")
     p.add_argument("--train-dir", default=None)
     p.add_argument("--num-classes", type=int, default=100)
-    p.add_argument("--iters", type=int, default=60)
-    p.add_argument("--lr", type=float, default=1.0)
+    p.add_argument("--iters", type=int, default=150)
+    p.add_argument("--lr", type=float, default=0.03)
     p.add_argument("--weight-decay", type=float, default=1e-3,
-                   help="L2 (mirrors the probe's regularization)")
+                   help="L2 (torch built-in, per-parameter — mirrors the probe's regularization)")
     p.add_argument("--out", default="probe_curve.png")
     p.add_argument("--title", default="Logistic-probe training curve\n"
                    "(cross-entropy on frozen SigLIP-2 gopt features)")
@@ -75,31 +75,22 @@ def main():
     crit_plain = nn.CrossEntropyLoss()
 
     clf = nn.Linear(X.shape[1], args.num_classes)
-    # LBFGS: full-batch quasi-Newton — smooth, monotonic convergence for a
-    # small linear probe (matches the clean shape of a logistic-probe curve).
-    opt = torch.optim.LBFGS(clf.parameters(), lr=args.lr, max_iter=1,
-                            history_size=10, line_search_fn="strong_wolfe")
-    wd = args.weight_decay
-
-    def closure():
-        opt.zero_grad()
-        loss = crit(clf(Xtr_t), ytr_t)
-        if wd:
-            loss = loss + wd * sum((p ** 2).sum() for p in clf.parameters())
-        loss.backward()
-        return loss
+    # Adam full-batch with torch's built-in (properly-scaled) weight decay.
+    # Gives a smooth monotonic descent for a small linear probe.
+    opt = torch.optim.Adam(clf.parameters(), lr=args.lr, weight_decay=args.weight_decay)
 
     tr_losses, va_losses = [], []
     for it in range(args.iters):
-        clf.train()
-        opt.step(closure)
+        clf.train(); opt.zero_grad()
+        loss = crit(clf(Xtr_t), ytr_t)
+        loss.backward(); opt.step()
         clf.eval()
         with torch.no_grad():
             tr = crit_plain(clf(Xtr_t), ytr_t).item()
             va = crit_plain(clf(Xva_t), yva_t).item()
             va_acc = (clf(Xva_t).argmax(1) == yva_t).float().mean().item()
         tr_losses.append(tr); va_losses.append(va)
-        if (it + 1) % 10 == 0:
+        if (it + 1) % 20 == 0:
             print(f"iter {it+1:3d}  train CE {tr:.3f}  val CE {va:.3f}  val acc {va_acc:.4f}")
 
     import matplotlib
