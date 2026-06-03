@@ -192,14 +192,21 @@ def write_probs(path, ids, probs, C):
 
 
 def fit_probe_with_cv(Xtr, ytr, Xte, C_reg, num_classes, n_splits=5):
-    """Fit a probe; report OOF accuracy via stratified CV; predict test probs."""
+    """Fit a probe; return (test_probs, oof_acc, oof_probs).
+
+    oof_probs[i] are the leak-free probabilities for train image i (predicted by
+    a fold that did NOT see it) — aligned across backbones since the split is
+    seeded, so a tuner can fit ensemble weights on them.
+    """
     skf = StratifiedKFold(n_splits=n_splits, shuffle=True, random_state=42)
-    oof = np.zeros(len(ytr))
+    oof_probs = np.zeros((len(ytr), num_classes))
     for tr, va in skf.split(Xtr, ytr):
         clf = LogisticRegression(C=C_reg, max_iter=2000, class_weight="balanced", n_jobs=-1)
         clf.fit(Xtr[tr], ytr[tr])
-        oof[va] = clf.predict(Xtr[va])
-    oof_acc = (oof == ytr).mean()
+        pr = clf.predict_proba(Xtr[va])
+        for j, cls in enumerate(clf.classes_):
+            oof_probs[va, cls] = pr[:, j]
+    oof_acc = (oof_probs.argmax(1) == ytr).mean()
 
     clf = LogisticRegression(C=C_reg, max_iter=2000, class_weight="balanced", n_jobs=-1)
     clf.fit(Xtr, ytr)
@@ -207,7 +214,7 @@ def fit_probe_with_cv(Xtr, ytr, Xte, C_reg, num_classes, n_splits=5):
     full = np.zeros((Xte.shape[0], num_classes))
     for j, cls in enumerate(clf.classes_):
         full[:, cls] = P[:, j]
-    return full, oof_acc
+    return full, oof_acc, oof_probs
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -271,10 +278,13 @@ def main():
             np.save(tr_cache, Xtr); np.save(te_cache, Xte)
             del bb; torch.cuda.empty_cache()
 
-        P, oof = fit_probe_with_cv(Xtr, ytr, Xte, args.C, C)
+        P, oof, oof_probs = fit_probe_with_cv(Xtr, ytr, Xte, args.C, C)
         print(f"  probe OOF acc = {oof:.4f}\n")
         probe_probs.append(P); oof_accs.append(oof)
         write_probs(Path(args.out_dir) / f"probe_{tag}.csv", te_fnames, P, C)
+        # save aligned OOF probs + labels for leak-free weight tuning
+        np.save(cache / f"oof_{tag}.npy", oof_probs)
+        np.save(cache / "labels.npy", ytr)
 
     # weights
     if args.weights:
