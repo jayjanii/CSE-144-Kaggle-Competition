@@ -6,6 +6,7 @@
 
 import argparse
 import os
+import random
 
 import numpy as np
 import torch
@@ -48,6 +49,8 @@ def main():
 
     Xtr, Xva, ytr, yva = train_test_split(X, y, test_size=0.2, random_state=SEED, stratify=y)
 
+    random.seed(SEED)
+    np.random.seed(SEED)
     torch.manual_seed(SEED)
     Xtr_t, ytr_t = torch.tensor(Xtr), torch.tensor(ytr)
     Xva_t, yva_t = torch.tensor(Xva), torch.tensor(yva)

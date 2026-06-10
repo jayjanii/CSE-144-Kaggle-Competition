@@ -26,4 +26,11 @@ build/
 .DS_Store
 Thumbs.db
 
+# Run artifacts
+cache/
+*.npy
+submission*.csv
+
 .*
+!.gitignore
+!.gitattributes

@@ -8,6 +8,7 @@ import argparse
 import csv
 import itertools
 import os
+import random
 from pathlib import Path
 
 import numpy as np
@@ -22,6 +23,15 @@ from data import get_data_dirs
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 SEED = 42
+
+
+def set_seed(seed=SEED):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
 
 
 def center_crop_view(img, size):
@@ -109,7 +119,7 @@ def oof_probe(X, y, C_reg, K):
     skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=SEED)
     oof = np.zeros((len(y), K))
     for tr, va in skf.split(X, y):
-        clf = LogisticRegression(C=C_reg, max_iter=2000, class_weight="balanced", n_jobs=-1)
+        clf = LogisticRegression(C=C_reg, max_iter=2000, class_weight="balanced", n_jobs=-1, random_state=SEED)
         clf.fit(X[tr], y[tr])
         pr = clf.predict_proba(X[va])
         for j, cls in enumerate(clf.classes_):
@@ -118,7 +128,7 @@ def oof_probe(X, y, C_reg, K):
 
 
 def full_probe(X, y, Xte, C_reg, K):
-    clf = LogisticRegression(C=C_reg, max_iter=2000, class_weight="balanced", n_jobs=-1)
+    clf = LogisticRegression(C=C_reg, max_iter=2000, class_weight="balanced", n_jobs=-1, random_state=SEED)
     clf.fit(X, y)
     P = np.zeros((len(Xte), K))
     pr = clf.predict_proba(Xte)
@@ -156,7 +166,13 @@ def main():
     p.add_argument("--baseline", type=float, default=0.9592)
     p.add_argument("--grid", default="0,0.25,0.5,0.75,1.0,1.5,2.0")
     p.add_argument("--write", default=None)
+    p.add_argument("--seed", type=int, default=SEED)
     args = p.parse_args()
+
+    set_seed(args.seed)
+    import sklearn
+    print(f"seed {args.seed} | torch {torch.__version__} | "
+          f"sklearn {sklearn.__version__} | numpy {np.__version__} | device {DEVICE}")
 
     train_dir, test_dir = args.train_dir, args.test_dir
     if not train_dir or not test_dir:
