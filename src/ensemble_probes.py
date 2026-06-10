@@ -183,30 +183,43 @@ def probe_members(backbones, y, C, K, pseudo=None):
     return oof, test, names
 
 
-def fit_weights(members_oof, y, grid, passes=6):
-    # coordinate ascent on the oof: first member pinned at 1, tune the rest one
-    # at a time. scales linearly with members (exhaustive grid blows up past ~3).
+def fit_weights(members_oof, y, grid, passes=4, restarts=60):
+    # random-restart coordinate ascent on the oof. first member pinned at 1, the
+    # rest tuned one at a time; restarts escape the local optima that plain greedy
+    # falls into. scales linearly with members (exhaustive grid blows up past ~3).
     M = len(members_oof)
-    w = [1.0] + [0.0] * (M - 1)
+    rng = np.random.RandomState(SEED)
 
     def acc_of(ww):
         mix = sum(wi * mo for wi, mo in zip(ww, members_oof))
         return float((mix.argmax(1) == y).mean())
 
-    best = acc_of(w)
-    for _ in range(passes):
-        improved = False
-        for i in range(1, M):
-            best_g = w[i]
-            for g in grid:
-                w[i] = g
-                a = acc_of(w)
-                if a > best:
-                    best, best_g, improved = a, g, True
-            w[i] = best_g
-        if not improved:
-            break
-    return best, tuple(w)
+    def ascend(w):
+        best = acc_of(w)
+        for _ in range(passes):
+            improved = False
+            for i in range(1, M):
+                best_g = w[i]
+                for g in grid:
+                    w[i] = g
+                    a = acc_of(w)
+                    if a > best:
+                        best, best_g, improved = a, g, True
+                w[i] = best_g
+            if not improved:
+                break
+        return best, tuple(w)
+
+    starts = [[1.0] + [0.0] * (M - 1)]  # canonical start
+    for _ in range(restarts):
+        starts.append([1.0] + [float(rng.choice(grid)) for _ in range(M - 1)])
+
+    best = (-1.0, None)
+    for s in starts:
+        a, w = ascend(s)
+        if a > best[0]:
+            best = (a, w)
+    return best
 
 
 def main():
