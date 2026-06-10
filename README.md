@@ -1,8 +1,9 @@
 # CSE 144 Final: SigLIP-2 frozen-probe ensemble
 
 Two frozen SigLIP-2 backbones (gopt-384, SO400M-512). Each gives a logistic
-probe + a zero-shot text head; the four members are averaged with weights tuned
-on a 5-fold OOF. See the report for details.
+probe and a zero-shot text head; these candidates are averaged with weights
+tuned on a 5-fold OOF (weak members can drop to zero). See the report for
+details.
 
 ## Run
 
