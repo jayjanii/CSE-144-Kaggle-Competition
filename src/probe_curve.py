@@ -86,38 +86,43 @@ def main():
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
 
+    plt.rcParams.update({
+        "font.family": "serif",
+        "font.size": 11,
+        "axes.edgecolor": "#333333",
+        "axes.linewidth": 0.8,
+    })
     xs = np.arange(1, args.iters + 1)
-    navy, gold = "#1E2761", "#E0A23B"
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 4.5))
+    blue, red = "#2166AC", "#B2182B"
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(11, 4.2))
 
-    # loss: faint per-fold val + bold mean train/val
+    # loss: blue train, red val; faint per-fold val behind the mean
     for v in va:
-        ax1.plot(xs, v, color=gold, lw=0.8, alpha=0.35)
-    ax1.plot(xs, va.mean(0), color=gold, lw=2.4, label="val (mean)")
-    ax1.plot(xs, tr.mean(0), color=navy, lw=2.4, label="train (mean)")
+        ax1.plot(xs, v, color=red, lw=0.7, alpha=0.22)
+    ax1.plot(xs, tr.mean(0), color=blue, lw=2.0, label="train")
+    ax1.plot(xs, va.mean(0), color=red, lw=2.0, label="validation")
     ax1.set_xlabel("iteration")
     ax1.set_ylabel("cross-entropy loss")
     ax1.set_title("Loss")
-    ax1.legend(frameon=False)
-    ax1.grid(alpha=0.25)
 
-    # accuracy: faint per-fold + bold mean
+    # accuracy: red mean with faint per-fold
     for a in acc:
-        ax2.plot(xs, a, color=navy, lw=0.8, alpha=0.35)
-    ax2.plot(xs, acc.mean(0), color=navy, lw=2.4, label="mean")
+        ax2.plot(xs, a, color=red, lw=0.7, alpha=0.22)
+    ax2.plot(xs, acc.mean(0), color=red, lw=2.0, label="validation (mean)")
     ax2.set_xlabel("iteration")
     ax2.set_ylabel("accuracy")
     ax2.set_title(f"Validation accuracy ({args.folds}-fold)")
-    ax2.legend(frameon=False)
-    ax2.grid(alpha=0.25)
 
     for ax in (ax1, ax2):
         ax.set_xlim(1, args.iters)
+        ax.legend(frameon=False)
+        ax.grid(True, color="#cccccc", lw=0.5, alpha=0.6)
+        ax.tick_params(direction="in", length=4)
         for s in ("top", "right"):
             ax.spines[s].set_visible(False)
     fig.suptitle(args.title, fontweight="bold")
     fig.tight_layout()
-    fig.savefig(args.out, dpi=150)
+    fig.savefig(args.out, dpi=200, bbox_inches="tight")
     fa = acc[:, -1]
     print(f"wrote {args.out}  (final val acc {fa.mean():.4f} +/- {fa.std():.4f})")
 
