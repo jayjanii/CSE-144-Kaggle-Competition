@@ -21,8 +21,10 @@ python src/ensemble_probes.py \
   --names class_names.csv --C 10 --write submission.csv
 ```
 
-Run from the repo root. Data downloads from Kaggle on first run (needs a token).
-`class_names.csv` (`class_id,name`) was built by hand and feeds the text head.
+Run from the repo root. The dataset ships in `data/` (`train/<class>/*.jpg`,
+`test/*.jpg`), so no Kaggle download is needed; if `data/` is ever missing it
+falls back to kagglehub (`~/.kaggle/kaggle.json`). `class_names.csv`
+(`class_id,name`) was built by hand and feeds the text head.
 
 Loss/accuracy figure:
 

@@ -1,9 +1,6 @@
 # Checkpoints
 *.pth
 
-# Data
-data/
-
 # WandB
 wandb/
 

@@ -8,5 +8,10 @@ def get_data_dirs(train_dir="data/train", test_dir="data/test"):
     if os.path.isdir(train_dir) and os.listdir(train_dir):
         return train_dir, test_dir
     import kagglehub
-    path = kagglehub.competition_download(COMPETITION)
+    try:
+        path = kagglehub.competition_download(COMPETITION)
+    except Exception as e:
+        raise SystemExit(
+            "kaggle download failed. put your kaggle.json at ~/.kaggle/kaggle.json, "
+            f"or stage the data under {train_dir}/.\n{e}")
     return os.path.join(path, "train"), os.path.join(path, "test")
