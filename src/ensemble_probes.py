@@ -3,7 +3,6 @@
 
 import argparse
 import csv
-import itertools
 import os
 import random
 import warnings
@@ -173,7 +172,9 @@ def probe_members(backbones, y, C, K, pseudo=None):
         if pseudo is not None:
             mask, labels = pseudo
             Xex, yex = b["Xte"][mask], labels
-        oof.append(oof_probe(b["Xtr"], y, C, K, Xex, yex))
+        po = oof_probe(b["Xtr"], y, C, K, Xex, yex)
+        print(f"  {b['name']} probe OOF {(po.argmax(1) == y).mean():.4f}")
+        oof.append(po)
         test.append(full_probe(b["Xtr"], y, b["Xte"], C, K, Xex, yex))
         names.append(f"{b['name']}[probe]")
         oof.append(b["Zo"])
@@ -182,18 +183,30 @@ def probe_members(backbones, y, C, K, pseudo=None):
     return oof, test, names
 
 
-def fit_weights(members_oof, y, grid):
-    # first member pinned at 1, grid-search the rest on the oof
-    best = (-1.0, None)
-    for combo in itertools.product(grid, repeat=len(members_oof) - 1):
-        w = (1.0,) + combo
-        if sum(w) == 0:
-            continue
-        mix = sum(wi * mo for wi, mo in zip(w, members_oof))
-        acc = (mix.argmax(1) == y).mean()
-        if acc > best[0]:
-            best = (float(acc), w)
-    return best
+def fit_weights(members_oof, y, grid, passes=6):
+    # coordinate ascent on the oof: first member pinned at 1, tune the rest one
+    # at a time. scales linearly with members (exhaustive grid blows up past ~3).
+    M = len(members_oof)
+    w = [1.0] + [0.0] * (M - 1)
+
+    def acc_of(ww):
+        mix = sum(wi * mo for wi, mo in zip(ww, members_oof))
+        return float((mix.argmax(1) == y).mean())
+
+    best = acc_of(w)
+    for _ in range(passes):
+        improved = False
+        for i in range(1, M):
+            best_g = w[i]
+            for g in grid:
+                w[i] = g
+                a = acc_of(w)
+                if a > best:
+                    best, best_g, improved = a, g, True
+            w[i] = best_g
+        if not improved:
+            break
+    return best, tuple(w)
 
 
 def main():
