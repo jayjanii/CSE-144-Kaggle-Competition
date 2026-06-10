@@ -1,27 +1,8 @@
-"""Multi-backbone frozen-probe ensemble, validated on leak-free OOF.
-
-Each backbone is frozen and used as a feature extractor (4 deterministic TTA
-views, mean-pooled). Each contributes a logistic PROBE; CLIP-family backbones
-(open_clip) additionally contribute a zero-shot TEXT branch. Every member is a
-probability matrix; the ensemble is a weighted average whose weights are
-searched on the leak-free 5-fold OOF (1079 train images).
-
-This is the clean way to add architectural diversity (e.g. DINOv2) without the
-fine-tuned models' validation problem: a frozen probe gives leak-free OOF over
-the same seeded split, so we can MEASURE whether the diversity helps.
-
-Backbone spec:  "type:model[:pretrained]:cache_dir"
-  openclip  -> open_clip (has text tower)        e.g. openclip:ViT-gopt-16-SigLIP2-384:webli:siglip2/cache_gopt
-  dinov2    -> torch.hub facebookresearch/dinov2  e.g. dinov2:dinov2_vitg14_reg:cache_dinov2
-  timm      -> timm.create_model(num_classes=0)   e.g. timm:eva02_large_patch14_448.mim_m38m_ft_in22k_in1k:cache_eva
-
-Usage:
-    python ensemble_probes.py \
-        --backbone openclip:ViT-gopt-16-SigLIP2-384:webli:siglip2/cache_gopt \
-        --backbone dinov2:dinov2_vitg14_reg:cache_dinov2 \
-        --names class_names.csv --C 10 --baseline 0.9592 \
-        --write submission_ensemble.csv
-"""
+# Frozen multi-backbone probe + zero-shot ensemble for the 100-class final.
+# Each SigLIP-2 backbone stays frozen and is used only as a feature extractor
+# (4-view TTA, mean-pooled). Every backbone contributes a logistic probe on the
+# frozen features and a zero-shot text head built from the class names. The
+# members are averaged with weights picked on the 5-fold OOF.
 
 import argparse
 import csv
@@ -37,13 +18,10 @@ from PIL import Image
 from sklearn.linear_model import LogisticRegression
 from sklearn.model_selection import StratifiedKFold
 
+from data import get_data_dirs
+
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 SEED = 42
-IMAGENET_MEAN = (0.485, 0.456, 0.406)
-IMAGENET_STD = (0.229, 0.224, 0.225)
-
-
-# ── TTA views + encoding ──────────────────────────────────────────────────────
 
 
 def center_crop_view(img, size):
@@ -79,46 +57,22 @@ def encode(image_fn, mean, std, paths, size, batch_size=12):
     return torch.cat(feats, 0).numpy()
 
 
-# ── Backbone loaders ──────────────────────────────────────────────────────────
-
-
-def load_backbone(btype, model_name, pretrained):
-    """Return dict(image_fn, text_fn|None, tokenizer|None, mean, std, size, scale)."""
-    if btype == "openclip":
-        import open_clip
-        model, _, _ = open_clip.create_model_and_transforms(model_name, pretrained=pretrained or "webli")
-        tok = open_clip.get_tokenizer(model_name)
-        model = model.to(DEVICE).eval()
-        vis = getattr(model.visual, "preprocess_cfg", {})
-        mean = torch.tensor(vis.get("mean", (0.5, 0.5, 0.5))).view(3, 1, 1)
-        std = torch.tensor(vis.get("std", (0.5, 0.5, 0.5))).view(3, 1, 1)
-        size = vis.get("size", (384, 384)); size = size[0] if isinstance(size, (tuple, list)) else size
-        scale = model.logit_scale.exp().item() if hasattr(model, "logit_scale") else 100.0
-        return dict(image_fn=lambda x: F.normalize(model.encode_image(x), dim=-1),
-                    text_fn=lambda pr: F.normalize(model.encode_text(tok(pr).to(DEVICE)), dim=-1),
-                    mean=mean, std=std, size=size, scale=scale, model=model)
-    if btype == "dinov2":
-        model = torch.hub.load("facebookresearch/dinov2", model_name).to(DEVICE).eval()
-        return dict(image_fn=lambda x: F.normalize(model(x), dim=-1), text_fn=None,
-                    mean=torch.tensor(IMAGENET_MEAN).view(3, 1, 1),
-                    std=torch.tensor(IMAGENET_STD).view(3, 1, 1),
-                    size=518, scale=None, model=model)
-    if btype == "timm":
-        import timm
-        try:
-            model = timm.create_model(model_name, pretrained=True, num_classes=0, dynamic_img_size=True)
-        except TypeError:
-            model = timm.create_model(model_name, pretrained=True, num_classes=0)
-        model = model.to(DEVICE).eval()
-        dc = timm.data.resolve_model_data_config(model)
-        return dict(image_fn=lambda x: F.normalize(model(x), dim=-1), text_fn=None,
-                    mean=torch.tensor(dc["mean"]).view(3, 1, 1),
-                    std=torch.tensor(dc["std"]).view(3, 1, 1),
-                    size=dc["input_size"][-1], scale=None, model=model)
-    raise SystemExit(f"unknown backbone type: {btype}")
-
-
-# ── Data ──────────────────────────────────────────────────────────────────────
+def load_backbone(model_name, pretrained):
+    import open_clip
+    model, _, _ = open_clip.create_model_and_transforms(model_name, pretrained=pretrained)
+    tok = open_clip.get_tokenizer(model_name)
+    model = model.to(DEVICE).eval()
+    vis = getattr(model.visual, "preprocess_cfg", {})
+    mean = torch.tensor(vis.get("mean", (0.5, 0.5, 0.5))).view(3, 1, 1)
+    std = torch.tensor(vis.get("std", (0.5, 0.5, 0.5))).view(3, 1, 1)
+    size = vis.get("size", (384, 384))
+    size = size[0] if isinstance(size, (tuple, list)) else size
+    scale = model.logit_scale.exp().item() if hasattr(model, "logit_scale") else 100.0
+    return dict(
+        image_fn=lambda x: F.normalize(model.encode_image(x), dim=-1),
+        text_fn=lambda pr: F.normalize(model.encode_text(tok(pr).to(DEVICE)), dim=-1),
+        mean=mean, std=std, size=size, scale=scale, model=model,
+    )
 
 
 def load_train(train_dir):
@@ -128,13 +82,16 @@ def load_train(train_dir):
         if os.path.isdir(d):
             for f in sorted(os.listdir(d)):
                 if f.lower().endswith((".jpg", ".jpeg", ".png")):
-                    paths.append(os.path.join(d, f)); labels.append(int(cls))
+                    paths.append(os.path.join(d, f))
+                    labels.append(int(cls))
     return paths, np.array(labels)
 
 
 def load_test(test_dir):
-    fn = sorted([f for f in os.listdir(test_dir) if f.lower().endswith((".jpg", ".jpeg", ".png"))],
-                key=lambda f: int(os.path.splitext(f)[0]))
+    fn = sorted(
+        [f for f in os.listdir(test_dir) if f.lower().endswith((".jpg", ".jpeg", ".png"))],
+        key=lambda f: int(os.path.splitext(f)[0]),
+    )
     return [os.path.join(test_dir, f) for f in fn], fn
 
 
@@ -148,20 +105,23 @@ def load_names(path, C):
     return names
 
 
-def oof_probe(Xtr, y, C_reg, K):
+def oof_probe(X, y, C_reg, K):
     skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=SEED)
     oof = np.zeros((len(y), K))
-    for tr, va in skf.split(Xtr, y):
+    for tr, va in skf.split(X, y):
         clf = LogisticRegression(C=C_reg, max_iter=2000, class_weight="balanced", n_jobs=-1)
-        clf.fit(Xtr[tr], y[tr]); pr = clf.predict_proba(Xtr[va])
+        clf.fit(X[tr], y[tr])
+        pr = clf.predict_proba(X[va])
         for j, cls in enumerate(clf.classes_):
             oof[va, cls] = pr[:, j]
     return oof
 
 
-def full_probe(Xtr, y, Xte, C_reg, K):
+def full_probe(X, y, Xte, C_reg, K):
     clf = LogisticRegression(C=C_reg, max_iter=2000, class_weight="balanced", n_jobs=-1)
-    clf.fit(Xtr, y); P = np.zeros((len(Xte), K)); pr = clf.predict_proba(Xte)
+    clf.fit(X, y)
+    P = np.zeros((len(Xte), K))
+    pr = clf.predict_proba(Xte)
     for j, cls in enumerate(clf.classes_):
         P[:, cls] = pr[:, j]
     return P
@@ -172,22 +132,20 @@ def text_probs(bb, names, templates, X):
         feats = []
         for nm in names:
             if not nm:
-                feats.append(None); continue
-            tf_ = bb["text_fn"]([t.format(nm) for t in templates]).mean(0)
-            feats.append(F.normalize(tf_, dim=0))
+                feats.append(None)
+                continue
+            t = bb["text_fn"]([tpl.format(nm) for tpl in templates]).mean(0)
+            feats.append(F.normalize(t, dim=0))
+        # any unnamed class falls back to the mean of the known text vectors
         known = F.normalize(torch.stack([t for t in feats if t is not None]).mean(0), dim=0)
         feats = torch.stack([t if t is not None else known for t in feats])
         return ((torch.tensor(X).to(DEVICE) @ feats.T) * bb["scale"]).softmax(1).cpu().numpy()
 
 
-# ── Main ──────────────────────────────────────────────────────────────────────
-
-
 def main():
-    p = argparse.ArgumentParser(description=__doc__,
-                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    p = argparse.ArgumentParser()
     p.add_argument("--backbone", action="append", required=True,
-                   help="type:model[:pretrained]:cache_dir")
+                   help="model:pretrained:cache_dir (repeatable)")
     p.add_argument("--names", default="class_names.csv")
     p.add_argument("--train-dir", default=None)
     p.add_argument("--test-dir", default=None)
@@ -202,9 +160,9 @@ def main():
 
     train_dir, test_dir = args.train_dir, args.test_dir
     if not train_dir or not test_dir:
-        from train import CONFIG, maybe_download_data
-        cfg = dict(CONFIG); maybe_download_data(cfg)
-        train_dir = train_dir or cfg["train_dir"]; test_dir = test_dir or cfg["test_dir"]
+        d_train, d_test = get_data_dirs()
+        train_dir = train_dir or d_train
+        test_dir = test_dir or d_test
 
     tr_paths, y = load_train(train_dir)
     te_paths, te_fnames = load_test(test_dir)
@@ -214,57 +172,43 @@ def main():
 
     members_oof, members_test, member_names = [], [], []
     for spec in args.backbone:
-        parts = spec.split(":")
-        btype, model_name = parts[0], parts[1]
-        if btype == "openclip":
-            pretrained, cache = parts[2], parts[3]
-        else:
-            pretrained, cache = None, parts[2]
-        cdir = Path(cache); cdir.mkdir(parents=True, exist_ok=True)
+        model_name, pretrained, cache = spec.split(":", 2)
+        cdir = Path(cache)
+        cdir.mkdir(parents=True, exist_ok=True)
         trc, tec = cdir / "train.npy", cdir / "test.npy"
 
-        need_text = (btype == "openclip")
-        # load model only if we must encode or need text
-        if trc.exists() and tec.exists() and not need_text:
+        print(f"\n{model_name}: loading backbone...")
+        bb = load_backbone(model_name, pretrained)
+        if trc.exists() and tec.exists():
             Xtr, Xte = np.load(trc), np.load(tec)
-            print(f"\n{model_name}: cached {Xtr.shape}")
-            bb = None
+            print(f"  cached embeddings {Xtr.shape}")
         else:
-            print(f"\n{model_name}: loading backbone...")
-            bb = load_backbone(btype, model_name, pretrained)
-            if trc.exists() and tec.exists():
-                Xtr, Xte = np.load(trc), np.load(tec)
-                print(f"  cached embeddings {Xtr.shape}")
-            else:
-                print(f"  encoding train ({len(tr_paths)}) @ {bb['size']}...")
-                Xtr = encode(bb["image_fn"], bb["mean"], bb["std"], tr_paths, bb["size"])
-                print(f"  encoding test ({len(te_paths)})...")
-                Xte = encode(bb["image_fn"], bb["mean"], bb["std"], te_paths, bb["size"])
-                np.save(trc, Xtr); np.save(tec, Xte)
+            print(f"  encoding train ({len(tr_paths)}) @ {bb['size']}...")
+            Xtr = encode(bb["image_fn"], bb["mean"], bb["std"], tr_paths, bb["size"])
+            print(f"  encoding test ({len(te_paths)})...")
+            Xte = encode(bb["image_fn"], bb["mean"], bb["std"], te_paths, bb["size"])
+            np.save(trc, Xtr)
+            np.save(tec, Xte)
 
-        # probe member
         Po = oof_probe(Xtr, y, args.C, K)
         Pt = full_probe(Xtr, y, Xte, args.C, K)
-        print(f"  PROBE  OOF acc {(Po.argmax(1) == y).mean():.4f}")
-        members_oof.append(Po); members_test.append(Pt); member_names.append(f"{model_name}[probe]")
+        print(f"  probe OOF acc {(Po.argmax(1) == y).mean():.4f}")
+        members_oof.append(Po)
+        members_test.append(Pt)
+        member_names.append(f"{model_name}[probe]")
 
-        # text member (open_clip only)
-        if need_text:
-            if bb is None:
-                bb = load_backbone(btype, model_name, pretrained)
-            Zo = text_probs(bb, names, templates, Xtr)
-            Zt = text_probs(bb, names, templates, Xte)
-            print(f"  TEXT   OOF acc {(Zo.argmax(1) == y).mean():.4f}")
-            members_oof.append(Zo); members_test.append(Zt); member_names.append(f"{model_name}[text]")
+        Zo = text_probs(bb, names, templates, Xtr)
+        Zt = text_probs(bb, names, templates, Xte)
+        print(f"  text  OOF acc {(Zo.argmax(1) == y).mean():.4f}")
+        members_oof.append(Zo)
+        members_test.append(Zt)
+        member_names.append(f"{model_name}[text]")
 
-        if bb is not None:
-            del bb; torch.cuda.empty_cache()
+        del bb
+        torch.cuda.empty_cache()
 
+    # search member weights on the OOF; first member is pinned at 1.0
     M = len(members_oof)
-    print(f"\n{M} members:")
-    for nm in member_names:
-        print(f"  - {nm}")
-
     grid = [float(x) for x in args.grid.split(",")]
     best = (-1.0, None)
     for combo in itertools.product(grid, repeat=M - 1):
@@ -276,27 +220,21 @@ def main():
         if acc > best[0]:
             best = (acc, w)
     acc, w = best
-    print(f"\n{'='*60}")
-    print("best weights:")
+
+    print("\nbest weights:")
     for nm, wi in zip(member_names, w):
-        print(f"  {nm:50s} {wi:g}")
+        print(f"  {nm:40s} {wi:g}")
     print(f"ensemble OOF: {acc:.4f}   baseline: {args.baseline:.4f}")
-    gain = (acc - args.baseline) * len(y)
-    if gain >= 2:
-        print(f"=> WINS by {gain:+.1f} images — worth keeping.")
-    elif gain > 0:
-        print(f"=> +{gain:.1f} images — within noise; single model is fine.")
-    else:
-        print(f"=> does NOT beat baseline ({gain:+.1f}). Keep the single model.")
 
     if args.write:
         mix = sum(wi * mt for wi, mt in zip(w, members_test))
         mix = mix / mix.sum(1, keepdims=True)
         with open(args.write, "w", newline="") as f:
-            wr = csv.writer(f); wr.writerow(["image_id", "predicted_class"])
+            wr = csv.writer(f)
+            wr.writerow(["image_id", "predicted_class"])
             for fn, row in zip(te_fnames, mix):
                 wr.writerow([fn, int(row.argmax())])
-        print(f"\nWrote {args.write}")
+        print(f"\nwrote {args.write}")
 
 
 if __name__ == "__main__":

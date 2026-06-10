@@ -1,19 +1,8 @@
-"""Plot the logistic-probe training curve (train + held-out cross-entropy).
-
-The submission probe uses sklearn LogisticRegression, which fits to convergence
-silently. To VISUALIZE convergence (a presentation artifact — does not affect
-predictions), this trains an equivalent linear softmax head with explicit
-full-batch gradient steps on the cached frozen embeddings and logs the
-cross-entropy on the train split and a held-out 20% split each iteration.
-
-Reads the cached embeddings written by siglip2_pipeline.py / ensemble_probes.py,
-so it needs no GPU and runs in seconds.
-
-Usage:
-    python probe_curve.py \
-        --emb siglip2/cache_gopt/train.npy \
-        --iters 60 --out probe_curve.png
-"""
+# Loss / accuracy curve for the linear probe (a figure for the report).
+# sklearn's LogisticRegression fits silently, so to actually see convergence we
+# train an equivalent linear softmax head with full-batch Adam on the cached
+# frozen embeddings and log train/val cross-entropy and val accuracy each step.
+# Runs on CPU in a few seconds; does not touch the submission predictions.
 
 import argparse
 import os
@@ -22,6 +11,8 @@ import numpy as np
 import torch
 import torch.nn as nn
 from sklearn.model_selection import train_test_split
+
+from data import get_data_dirs
 
 SEED = 42
 
@@ -38,79 +29,81 @@ def load_labels(train_dir):
 
 
 def main():
-    p = argparse.ArgumentParser(description=__doc__)
+    p = argparse.ArgumentParser()
     p.add_argument("--emb", required=True, help="cached train embeddings .npy")
     p.add_argument("--train-dir", default=None)
     p.add_argument("--num-classes", type=int, default=100)
     p.add_argument("--iters", type=int, default=60)
     p.add_argument("--lr", type=float, default=0.1)
-    p.add_argument("--weight-decay", type=float, default=1e-3,
-                   help="L2 (torch built-in, per-parameter — mirrors the probe's regularization)")
+    p.add_argument("--weight-decay", type=float, default=1e-3)
     p.add_argument("--out", default="probe_curve.png")
-    p.add_argument("--title", default="Logistic-probe training curve\n"
-                   "(cross-entropy on frozen SigLIP-2 gopt features)")
+    p.add_argument("--title", default="Linear-probe training curve")
     args = p.parse_args()
 
-    train_dir = args.train_dir
-    if not train_dir:
-        from train import CONFIG, maybe_download_data
-        cfg = dict(CONFIG); maybe_download_data(cfg); train_dir = cfg["train_dir"]
+    train_dir = args.train_dir or get_data_dirs()[0]
 
     X = np.load(args.emb).astype(np.float32)
     y = load_labels(train_dir)
     assert len(X) == len(y), f"emb {len(X)} != labels {len(y)}"
 
-    Xtr, Xva, ytr, yva = train_test_split(
-        X, y, test_size=0.2, random_state=SEED, stratify=y)
+    Xtr, Xva, ytr, yva = train_test_split(X, y, test_size=0.2, random_state=SEED, stratify=y)
 
     torch.manual_seed(SEED)
-    Xtr_t = torch.tensor(Xtr); ytr_t = torch.tensor(ytr)
-    Xva_t = torch.tensor(Xva); yva_t = torch.tensor(yva)
+    Xtr_t, ytr_t = torch.tensor(Xtr), torch.tensor(ytr)
+    Xva_t, yva_t = torch.tensor(Xva), torch.tensor(yva)
 
-    # balanced class weights (mirrors class_weight="balanced")
+    # balanced class weights, mirroring the probe's class_weight="balanced"
     counts = np.bincount(ytr, minlength=args.num_classes).astype(np.float32)
-    w = len(ytr) / (args.num_classes * np.maximum(counts, 1))
-    cw = torch.tensor(w, dtype=torch.float32)
+    cw = torch.tensor(len(ytr) / (args.num_classes * np.maximum(counts, 1)), dtype=torch.float32)
     crit = nn.CrossEntropyLoss(weight=cw)
     crit_plain = nn.CrossEntropyLoss()
 
     clf = nn.Linear(X.shape[1], args.num_classes)
-    # Adam full-batch with torch's built-in (properly-scaled) weight decay.
-    # Gives a smooth monotonic descent for a small linear probe.
     opt = torch.optim.Adam(clf.parameters(), lr=args.lr, weight_decay=args.weight_decay)
 
-    tr_losses, va_losses = [], []
+    tr_losses, va_losses, va_accs = [], [], []
     for it in range(args.iters):
-        clf.train(); opt.zero_grad()
-        loss = crit(clf(Xtr_t), ytr_t)
-        loss.backward(); opt.step()
+        clf.train()
+        opt.zero_grad()
+        crit(clf(Xtr_t), ytr_t).backward()
+        opt.step()
         clf.eval()
         with torch.no_grad():
             tr = crit_plain(clf(Xtr_t), ytr_t).item()
             va = crit_plain(clf(Xva_t), yva_t).item()
-            va_acc = (clf(Xva_t).argmax(1) == yva_t).float().mean().item()
-        tr_losses.append(tr); va_losses.append(va)
+            acc = (clf(Xva_t).argmax(1) == yva_t).float().mean().item()
+        tr_losses.append(tr)
+        va_losses.append(va)
+        va_accs.append(acc)
         if (it + 1) % 20 == 0:
-            print(f"iter {it+1:3d}  train CE {tr:.3f}  val CE {va:.3f}  val acc {va_acc:.4f}")
+            print(f"iter {it+1:3d}  train CE {tr:.3f}  val CE {va:.3f}  val acc {acc:.4f}")
 
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
+
     xs = np.arange(1, args.iters + 1)
-    fig, ax = plt.subplots(figsize=(9.5, 5.2))
-    ax.plot(xs, tr_losses, color="#1E2761", lw=2.6, label="training loss")
-    ax.plot(xs, va_losses, color="#E0A23B", lw=2.6, label="validation loss (held-out 20%)")
-    ax.set_xlabel("iteration", fontsize=12)
-    ax.set_ylabel("cross-entropy loss", fontsize=12)
-    ax.set_title(args.title, fontsize=14, fontweight="bold", color="#1E2761")
-    ax.legend(frameon=False, fontsize=12)
-    ax.grid(alpha=0.25)
-    ax.set_xlim(1, args.iters)
-    for spine in ("top", "right"):
-        ax.spines[spine].set_visible(False)
+    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(12, 4.5))
+    ax1.plot(xs, tr_losses, color="#1E2761", lw=2.4, label="train")
+    ax1.plot(xs, va_losses, color="#E0A23B", lw=2.4, label="val (held-out 20%)")
+    ax1.set_xlabel("iteration")
+    ax1.set_ylabel("cross-entropy loss")
+    ax1.set_title("Loss")
+    ax1.legend(frameon=False)
+    ax1.grid(alpha=0.25)
+    ax2.plot(xs, va_accs, color="#1E2761", lw=2.4)
+    ax2.set_xlabel("iteration")
+    ax2.set_ylabel("accuracy")
+    ax2.set_title("Validation accuracy")
+    ax2.grid(alpha=0.25)
+    for ax in (ax1, ax2):
+        ax.set_xlim(1, args.iters)
+        for s in ("top", "right"):
+            ax.spines[s].set_visible(False)
+    fig.suptitle(args.title, fontweight="bold")
     fig.tight_layout()
     fig.savefig(args.out, dpi=150)
-    print(f"\nWrote {args.out}  (final: train {tr_losses[-1]:.3f}, val {va_losses[-1]:.3f})")
+    print(f"\nwrote {args.out}  (final train {tr_losses[-1]:.3f}, val {va_losses[-1]:.3f}, acc {va_accs[-1]:.4f})")
 
 
 if __name__ == "__main__":

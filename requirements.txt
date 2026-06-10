@@ -1,7 +1,8 @@
 torch
 torchvision
-timm
-albumentations
-transformers
-wandb
+open_clip_torch
+scikit-learn
+numpy
+pillow
+matplotlib
 kagglehub
