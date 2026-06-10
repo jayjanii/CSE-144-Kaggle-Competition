@@ -1,25 +1,29 @@
 #!/usr/bin/env bash
-# End-to-end reproduction. Run from the repo root: `bash run.sh`
-# Works on a Colab GPU runtime and on a local machine.
+# run the whole thing: bash run.sh (from the repo root)
 set -e
 
-# Colab already ships torch, torchvision, scikit-learn, numpy, pillow and
-# matplotlib with the correct CUDA build. Reinstalling torch from PyPI can
-# break the GPU, so only install the two packages Colab is missing.
-pip install -q open_clip_torch kagglehub
+PY=$(command -v python || command -v python3 || true)
+if [ -z "$PY" ]; then
+  echo "no python found" >&2
+  exit 1
+fi
 
-# Record the exact environment that produced this run.
-pip freeze > env.txt
+# on colab torch etc. are already there (don't reinstall, it breaks the gpu);
+# anywhere else grab the full requirements.
+if "$PY" -c "import google.colab" 2>/dev/null; then
+  "$PY" -m pip install -q open_clip_torch kagglehub
+else
+  "$PY" -m pip install -q -r requirements.txt
+fi
 
-# The competition data downloads automatically via kagglehub on first run.
-# This needs a Kaggle token (~/.kaggle/kaggle.json) and you must have joined
-# the competition. Alternatively drop the data under ./data/{train,test}.
+"$PY" -m pip freeze > env.txt  # note what we actually ran with
 
-python ensemble_probes.py \
+# data pulls from kaggle on first run (needs a kaggle token + comp access)
+"$PY" src/ensemble_probes.py \
   --backbone ViT-gopt-16-SigLIP2-384:webli:cache/gopt \
   --backbone ViT-SO400M-16-SigLIP2-512:webli:cache/so400m512 \
   --names class_names.csv --C 10 \
   --write submission.csv
 
-# Loss / accuracy figure for the report (reuses the cached gopt embeddings).
-python probe_curve.py --emb cache/gopt/train.npy --out probe_curve.png
+# figure for the report
+"$PY" src/probe_curve.py --emb cache/gopt/train.npy --out probe_curve.png

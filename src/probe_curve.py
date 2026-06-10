@@ -1,8 +1,5 @@
-# Loss / accuracy curve for the linear probe (a figure for the report).
-# sklearn's LogisticRegression fits silently, so to actually see convergence we
-# train an equivalent linear softmax head with full-batch Adam on the cached
-# frozen embeddings and log train/val cross-entropy and val accuracy each step.
-# Runs on CPU in a few seconds; does not touch the submission predictions.
+# loss/acc curve for the report. sklearn fits silently, so we just retrain an
+# equivalent linear head with adam on the cached embeddings to get a curve.
 
 import argparse
 import os
@@ -55,7 +52,7 @@ def main():
     Xtr_t, ytr_t = torch.tensor(Xtr), torch.tensor(ytr)
     Xva_t, yva_t = torch.tensor(Xva), torch.tensor(yva)
 
-    # balanced class weights, mirroring the probe's class_weight="balanced"
+    # balanced class weights, same as the probe
     counts = np.bincount(ytr, minlength=args.num_classes).astype(np.float32)
     cw = torch.tensor(len(ytr) / (args.num_classes * np.maximum(counts, 1)), dtype=torch.float32)
     crit = nn.CrossEntropyLoss(weight=cw)

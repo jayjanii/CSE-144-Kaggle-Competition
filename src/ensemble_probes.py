@@ -1,8 +1,5 @@
-# Frozen multi-backbone probe + zero-shot ensemble for the 100-class final.
-# Each SigLIP-2 backbone stays frozen and is used only as a feature extractor
-# (4-view TTA, mean-pooled). Every backbone contributes a logistic probe on the
-# frozen features and a zero-shot text head built from the class names. The
-# members are averaged with weights picked on the 5-fold OOF.
+# frozen siglip-2 ensemble: each backbone gives a logistic probe + a zero-shot
+# text head, averaged with weights picked on the oof.
 
 import argparse
 import csv
@@ -146,7 +143,7 @@ def text_probs(bb, names, templates, X):
                 continue
             t = bb["text_fn"]([tpl.format(nm) for tpl in templates]).mean(0)
             feats.append(F.normalize(t, dim=0))
-        # any unnamed class falls back to the mean of the known text vectors
+        # unnamed class -> just use the average text vector
         known = F.normalize(torch.stack([t for t in feats if t is not None]).mean(0), dim=0)
         feats = torch.stack([t if t is not None else known for t in feats])
         return ((torch.tensor(X).to(DEVICE) @ feats.T) * bb["scale"]).softmax(1).cpu().numpy()
@@ -223,7 +220,7 @@ def main():
         del bb
         torch.cuda.empty_cache()
 
-    # search member weights on the OOF; first member is pinned at 1.0
+    # grid-search the weights on the oof, first member pinned at 1
     M = len(members_oof)
     grid = [float(x) for x in args.grid.split(",")]
     best = (-1.0, None)
