@@ -47,7 +47,7 @@ def four_views(img, size):
 
 
 @torch.inference_mode()
-def encode(image_fn, mean, std, paths, size, batch_size=12):
+def encode(image_fn, mean, std, paths, size, batch_size=32):
     feats = []
     for i in range(0, len(paths), batch_size):
         chunk = paths[i:i + batch_size]
@@ -57,9 +57,11 @@ def encode(image_fn, mean, std, paths, size, batch_size=12):
             for v in four_views(img, size):
                 views.append((TF.to_tensor(v) - mean) / std)
         x = torch.stack(views).to(DEVICE)
-        e = image_fn(x).reshape(len(chunk), 4, -1).mean(1)
-        feats.append(F.normalize(e, dim=-1).cpu().float())
-        if (i // batch_size + 1) % 20 == 0:
+        # frozen backbone, so half precision on gpu is free speed
+        with torch.autocast(DEVICE, dtype=torch.float16, enabled=DEVICE == "cuda"):
+            e = image_fn(x).reshape(len(chunk), 4, -1).mean(1)
+        feats.append(F.normalize(e.float(), dim=-1).cpu())
+        if (i // batch_size + 1) % 10 == 0:
             print(f"    {i + len(chunk)}/{len(paths)}")
     return torch.cat(feats, 0).numpy()
 
@@ -157,6 +159,7 @@ def main():
     p.add_argument("--train-dir", default=None)
     p.add_argument("--test-dir", default=None)
     p.add_argument("--num-classes", type=int, default=100)
+    p.add_argument("--batch-size", type=int, default=32)
     p.add_argument("--C", type=float, default=10.0)
     p.add_argument("--templates",
                    default="a photo of a {}.,a close-up photo of a {}.,a {} on a plain background.")
@@ -197,9 +200,9 @@ def main():
             print(f"  cached embeddings {Xtr.shape}")
         else:
             print(f"  encoding train ({len(tr_paths)}) @ {bb['size']}...")
-            Xtr = encode(bb["image_fn"], bb["mean"], bb["std"], tr_paths, bb["size"])
+            Xtr = encode(bb["image_fn"], bb["mean"], bb["std"], tr_paths, bb["size"], args.batch_size)
             print(f"  encoding test ({len(te_paths)})...")
-            Xte = encode(bb["image_fn"], bb["mean"], bb["std"], te_paths, bb["size"])
+            Xte = encode(bb["image_fn"], bb["mean"], bb["std"], te_paths, bb["size"], args.batch_size)
             np.save(trc, Xtr)
             np.save(tec, Xte)
 
