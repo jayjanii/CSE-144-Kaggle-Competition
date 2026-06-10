@@ -6,6 +6,7 @@ import csv
 import itertools
 import os
 import random
+import warnings
 from pathlib import Path
 
 import numpy as np
@@ -20,6 +21,9 @@ from data import get_data_dirs
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 SEED = 42
+
+# a few classes have <5 images, so stratified k-fold cant fill every fold; fine
+warnings.filterwarnings("ignore", message="The least populated class")
 
 
 def set_seed(seed=SEED):
@@ -241,6 +245,13 @@ def main():
     for nm, wi in zip(member_names, w):
         print(f"  {nm:40s} {wi:g}")
     print(f"ensemble OOF: {acc:.4f}   baseline: {args.baseline:.4f}")
+
+    # per-fold accuracy of the chosen ensemble (same seeded folds as the probes)
+    mix = sum(wi * mo for wi, mo in zip(w, members_oof))
+    skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=SEED)
+    fold_accs = [float((mix[va].argmax(1) == y[va]).mean()) for _, va in skf.split(mix, y)]
+    print("per-fold acc: " + "  ".join(f"{a:.4f}" for a in fold_accs))
+    print(f"  mean {np.mean(fold_accs):.4f}  std {np.std(fold_accs):.4f}")
 
     if args.write:
         mix = sum(wi * mt for wi, mt in zip(w, members_test))
