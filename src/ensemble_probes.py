@@ -118,21 +118,31 @@ def load_names(path, C):
     return names
 
 
-def oof_probe(X, y, C_reg, K):
+def _logreg(C_reg):
+    return LogisticRegression(C=C_reg, max_iter=2000, class_weight="balanced",
+                              n_jobs=-1, random_state=SEED)
+
+
+def oof_probe(X, y, C_reg, K, Xex=None, yex=None):
+    # Xex/yex: optional pseudo-labeled rows added to every fold's train (never val)
     skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=SEED)
     oof = np.zeros((len(y), K))
     for tr, va in skf.split(X, y):
-        clf = LogisticRegression(C=C_reg, max_iter=2000, class_weight="balanced", n_jobs=-1, random_state=SEED)
-        clf.fit(X[tr], y[tr])
+        Xf, yf = X[tr], y[tr]
+        if Xex is not None and len(Xex):
+            Xf, yf = np.concatenate([Xf, Xex]), np.concatenate([yf, yex])
+        clf = _logreg(C_reg).fit(Xf, yf)
         pr = clf.predict_proba(X[va])
         for j, cls in enumerate(clf.classes_):
             oof[va, cls] = pr[:, j]
     return oof
 
 
-def full_probe(X, y, Xte, C_reg, K):
-    clf = LogisticRegression(C=C_reg, max_iter=2000, class_weight="balanced", n_jobs=-1, random_state=SEED)
-    clf.fit(X, y)
+def full_probe(X, y, Xte, C_reg, K, Xex=None, yex=None):
+    Xf, yf = X, y
+    if Xex is not None and len(Xex):
+        Xf, yf = np.concatenate([X, Xex]), np.concatenate([y, yex])
+    clf = _logreg(C_reg).fit(Xf, yf)
     P = np.zeros((len(Xte), K))
     pr = clf.predict_proba(Xte)
     for j, cls in enumerate(clf.classes_):
@@ -155,6 +165,37 @@ def text_probs(bb, names, templates, X):
         return ((torch.tensor(X).to(DEVICE) @ feats.T) * bb["scale"]).softmax(1).cpu().numpy()
 
 
+def probe_members(backbones, y, C, K, pseudo=None):
+    # assemble probe (re-fit, optionally with pseudo) + cached text member per backbone
+    oof, test, names = [], [], []
+    for b in backbones:
+        Xex = yex = None
+        if pseudo is not None:
+            mask, labels = pseudo
+            Xex, yex = b["Xte"][mask], labels
+        oof.append(oof_probe(b["Xtr"], y, C, K, Xex, yex))
+        test.append(full_probe(b["Xtr"], y, b["Xte"], C, K, Xex, yex))
+        names.append(f"{b['name']}[probe]")
+        oof.append(b["Zo"])
+        test.append(b["Zt"])
+        names.append(f"{b['name']}[text]")
+    return oof, test, names
+
+
+def fit_weights(members_oof, y, grid):
+    # first member pinned at 1, grid-search the rest on the oof
+    best = (-1.0, None)
+    for combo in itertools.product(grid, repeat=len(members_oof) - 1):
+        w = (1.0,) + combo
+        if sum(w) == 0:
+            continue
+        mix = sum(wi * mo for wi, mo in zip(w, members_oof))
+        acc = (mix.argmax(1) == y).mean()
+        if acc > best[0]:
+            best = (float(acc), w)
+    return best
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--backbone", action="append", required=True,
@@ -169,6 +210,8 @@ def main():
                    default="a photo of a {}.,a close-up photo of a {}.,a {} on a plain background.")
     p.add_argument("--baseline", type=float, default=0.9592)
     p.add_argument("--grid", default="0,0.25,0.5,0.75,1.0,1.5,2.0")
+    p.add_argument("--pseudo", type=float, default=0.0,
+                   help="self-train: add test preds with confidence >= this (0 = off)")
     p.add_argument("--write", default=None)
     p.add_argument("--seed", type=int, default=SEED)
     args = p.parse_args()
@@ -190,7 +233,8 @@ def main():
     names = load_names(args.names, K)
     templates = [t.strip() for t in args.templates.split(",")]
 
-    members_oof, members_test, member_names = [], [], []
+    # encode each backbone once and keep its embeddings + zero-shot text members
+    backbones = []
     for spec in args.backbone:
         model_name, pretrained, cache = spec.split(":", 2)
         cdir = Path(cache)
@@ -210,56 +254,45 @@ def main():
             np.save(trc, Xtr)
             np.save(tec, Xte)
 
-        Po = oof_probe(Xtr, y, args.C, K)
-        Pt = full_probe(Xtr, y, Xte, args.C, K)
-        print(f"  probe OOF acc {(Po.argmax(1) == y).mean():.4f}")
-        members_oof.append(Po)
-        members_test.append(Pt)
-        member_names.append(f"{model_name}[probe]")
-
         Zo = text_probs(bb, names, templates, Xtr)
         Zt = text_probs(bb, names, templates, Xte)
         print(f"  text  OOF acc {(Zo.argmax(1) == y).mean():.4f}")
-        members_oof.append(Zo)
-        members_test.append(Zt)
-        member_names.append(f"{model_name}[text]")
-
+        backbones.append(dict(name=model_name, Xtr=Xtr, Xte=Xte, Zo=Zo, Zt=Zt))
         del bb
         torch.cuda.empty_cache()
 
-    # grid-search the weights on the oof, first member pinned at 1
-    M = len(members_oof)
     grid = [float(x) for x in args.grid.split(",")]
-    best = (-1.0, None)
-    for combo in itertools.product(grid, repeat=M - 1):
-        w = (1.0,) + combo
-        if sum(w) == 0:
-            continue
-        mix = sum(wi * mo for wi, mo in zip(w, members_oof))
-        acc = (mix.argmax(1) == y).mean()
-        if acc > best[0]:
-            best = (acc, w)
-    acc, w = best
-
-    print("\nbest weights:")
-    for nm, wi in zip(member_names, w):
-        print(f"  {nm:40s} {wi:g}")
-    print(f"ensemble OOF: {acc:.4f}   baseline: {args.baseline:.4f}")
-
-    # per-fold accuracy of the chosen ensemble (same seeded folds as the probes)
-    mix = sum(wi * mo for wi, mo in zip(w, members_oof))
     skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=SEED)
-    fold_accs = [float((mix[va].argmax(1) == y[va]).mean()) for _, va in skf.split(mix, y)]
-    print("per-fold acc: " + "  ".join(f"{a:.4f}" for a in fold_accs))
-    print(f"  mean {np.mean(fold_accs):.4f}  std {np.std(fold_accs):.4f}")
+
+    def evaluate(pseudo, tag):
+        m_oof, m_test, m_names = probe_members(backbones, y, args.C, K, pseudo)
+        a, w = fit_weights(m_oof, y, grid)
+        print(f"\n[{tag}] best weights:")
+        for nm, wi in zip(m_names, w):
+            print(f"  {nm:40s} {wi:g}")
+        print(f"[{tag}] ensemble OOF: {a:.4f}   baseline: {args.baseline:.4f}")
+        oof_mix = sum(wi * mo for wi, mo in zip(w, m_oof))
+        fa = [float((oof_mix[va].argmax(1) == y[va]).mean()) for _, va in skf.split(oof_mix, y)]
+        print("  per-fold: " + "  ".join(f"{x:.4f}" for x in fa) +
+              f"  (mean {np.mean(fa):.4f}, std {np.std(fa):.4f})")
+        test_mix = sum(wi * mt for wi, mt in zip(w, m_test))
+        return a, test_mix / test_mix.sum(1, keepdims=True)
+
+    acc, test_mix = evaluate(None, "frozen")
+
+    if args.pseudo > 0:
+        conf, pred = test_mix.max(1), test_mix.argmax(1)
+        mask = conf >= args.pseudo
+        print(f"\npseudo-labeling: {int(mask.sum())}/{len(mask)} test imgs >= {args.pseudo}")
+        if mask.sum() > 0:
+            acc, test_mix = evaluate((mask, pred[mask].astype(int)), "pseudo")
+            print("  (note: pseudo-OOF is mildly optimistic; trust the public LB)")
 
     if args.write:
-        mix = sum(wi * mt for wi, mt in zip(w, members_test))
-        mix = mix / mix.sum(1, keepdims=True)
         with open(args.write, "w", newline="") as f:
             wr = csv.writer(f)
             wr.writerow(["image_id", "predicted_class"])
-            for fn, row in zip(te_fnames, mix):
+            for fn, row in zip(te_fnames, test_mix):
                 wr.writerow([fn, int(row.argmax())])
         print(f"\nwrote {args.write}")
 
