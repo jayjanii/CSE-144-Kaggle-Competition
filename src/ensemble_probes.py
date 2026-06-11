@@ -149,48 +149,36 @@ def full_probe(X, y, Xte, C_reg, K, Xex=None, yex=None):
     return P
 
 
-def text_probs(bb, names, templates, X, temp=1.0):
+def text_probs(bb, names, X, temp=1.0):
     with torch.inference_mode():
         feats = []
         for i, nm in enumerate(names):
             if not nm:
                 feats.append(None)
                 continue
-            
-            # Category-specific prompt templates to resolve class name ambiguities
-            if 0 <= i <= 24:      # Food
-                tpls = [
-                    "a photo of {}, a type of food.",
-                    "a plate of delicious {}.",
-                    "a close-up photo of the food {}."
-                ]
-            elif 25 <= i <= 49:   # Flowers
-                tpls = [
-                    "a close-up photo of a {} flower.",
-                    "a photo of {}, a type of flower.",
-                    "the beautiful {} flower."
-                ]
-            elif 50 <= i <= 74:   # Cars
-                tpls = [
-                    "a photo of the car model {}.",
-                    "a photo of the vehicle {}.",
-                    "a {} driving on the street."
-                ]
-            elif 75 <= i <= 99:   # Aircraft
-                tpls = [
-                    "a photo of the {} aircraft.",
-                    "the airplane {} in flight.",
-                    "a photo of the {} plane."
-                ]
-            else:                 # Fallback to default
-                tpls = templates
-
+            # category-specific prompts to pin down ambiguous names
+            if i < 25:        # food
+                tpls = ["a photo of {}, a type of food.",
+                        "a plate of delicious {}.",
+                        "a close-up photo of the food {}."]
+            elif i < 50:      # flowers
+                tpls = ["a close-up photo of a {} flower.",
+                        "a photo of {}, a type of flower.",
+                        "the beautiful {} flower."]
+            elif i < 75:      # cars
+                tpls = ["a photo of the car model {}.",
+                        "a photo of the vehicle {}.",
+                        "a {} driving on the street."]
+            else:             # aircraft
+                tpls = ["a photo of the {} aircraft.",
+                        "the airplane {} in flight.",
+                        "a photo of the {} plane."]
             t = bb["text_fn"]([tpl.format(nm) for tpl in tpls]).mean(0)
             feats.append(F.normalize(t, dim=0))
         # unnamed class -> just use the average text vector
         known = F.normalize(torch.stack([t for t in feats if t is not None]).mean(0), dim=0)
         feats = torch.stack([t if t is not None else known for t in feats])
-        # scale the logits by both model scale and temperature
+        # temperature on top of the model's own logit scale
         logits = (torch.tensor(X).to(DEVICE) @ feats.T) * (bb["scale"] / temp)
         return logits.softmax(1).cpu().numpy()
 
@@ -212,26 +200,23 @@ def probe_members(backbones, y, C, K, pseudo=None):
         test.append(b["Zt"])
         names.append(f"{b['name']}[text]")
 
-    # Concatenated probe (Early Fusion)
+    # early-fusion probe on the concatenated embeddings
     if len(backbones) > 1:
         Xtr_concat = np.concatenate([b["Xtr"] for b in backbones], axis=-1)
         Xte_concat = np.concatenate([b["Xte"] for b in backbones], axis=-1)
-        # Re-normalize L2 so that concatenated features behave nicely
+        # renormalize after concat
         Xtr_concat = Xtr_concat / np.linalg.norm(Xtr_concat, axis=-1, keepdims=True)
         Xte_concat = Xte_concat / np.linalg.norm(Xte_concat, axis=-1, keepdims=True)
-        
         Xex_concat = yex_concat = None
         if pseudo is not None:
             mask, labels = pseudo
-            Xex_concat = Xte_concat[mask]
-            yex_concat = labels
-            
+            Xex_concat, yex_concat = Xte_concat[mask], labels
         po_concat = oof_probe(Xtr_concat, y, C, K, Xex_concat, yex_concat)
         print(f"  Concatenated probe OOF {(po_concat.argmax(1) == y).mean():.4f}")
         oof.append(po_concat)
         test.append(full_probe(Xtr_concat, y, Xte_concat, C, K, Xex_concat, yex_concat))
         names.append("Concatenated[probe]")
-        
+
     return oof, test, names
 
 
@@ -284,8 +269,6 @@ def main():
     p.add_argument("--num-classes", type=int, default=100)
     p.add_argument("--batch-size", type=int, default=32)
     p.add_argument("--C", type=float, default=10.0)
-    p.add_argument("--templates",
-                   default="a photo of a {}.,a close-up photo of a {}.,a {} on a plain background.")
     p.add_argument("--baseline", type=float, default=0.9592)
     p.add_argument("--grid", default="0,0.25,0.5,0.75,1.0,1.5,2.0")
     p.add_argument("--pseudo", type=float, default=0.0,
@@ -309,7 +292,6 @@ def main():
     te_paths, te_fnames = load_test(test_dir)
     K = args.num_classes
     names = load_names(args.names, K)
-    templates = [t.strip() for t in args.templates.split(",")]
 
     # encode each backbone once and keep its embeddings + zero-shot text members
     backbones = []
@@ -332,20 +314,17 @@ def main():
             np.save(trc, Xtr)
             np.save(tec, Xte)
 
-        # Optimize temperature scale on OOF train predictions using cross-entropy log-loss
-        best_temp = 1.0
-        best_loss = float("inf")
-        # Grid search over temperature values
+        # tune the text-head temperature on oof log-loss
+        best_temp, best_loss = 1.0, float("inf")
         for temp in [0.5, 0.75, 1.0, 1.25, 1.5, 2.0, 2.5, 3.0, 4.0, 5.0]:
-            Zo_temp = text_probs(bb, names, templates, Xtr, temp=temp)
+            Zo_temp = text_probs(bb, names, Xtr, temp=temp)
             eps = 1e-15
             loss = -np.mean(np.log(np.clip(Zo_temp[np.arange(len(y)), y], eps, 1.0 - eps)))
             if loss < best_loss:
-                best_loss = loss
-                best_temp = temp
-        
-        Zo = text_probs(bb, names, templates, Xtr, temp=best_temp)
-        Zt = text_probs(bb, names, templates, Xte, temp=best_temp)
+                best_loss, best_temp = loss, temp
+
+        Zo = text_probs(bb, names, Xtr, temp=best_temp)
+        Zt = text_probs(bb, names, Xte, temp=best_temp)
         print(f"  text OOF acc {(Zo.argmax(1) == y).mean():.4f} (temp {best_temp:.2f}, loss {best_loss:.4f})")
         backbones.append(dict(name=model_name, Xtr=Xtr, Xte=Xte, Zo=Zo, Zt=Zt))
         del bb

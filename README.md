@@ -18,7 +18,7 @@ pip install -r requirements.txt
 python src/ensemble_probes.py \
   --backbone ViT-gopt-16-SigLIP2-384:webli:cache/gopt \
   --backbone ViT-SO400M-16-SigLIP2-512:webli:cache/so400m512 \
-  --names class_names.csv --C 10 --write submission.csv
+  --pseudo 0.85 --write submission.csv
 ```
 
 Run from the repo root. The dataset ships in `data/` (`train/<class>/*.jpg`,
