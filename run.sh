@@ -22,11 +22,12 @@ fi
 GOPT=${GOPT:-cache/gopt}
 SO=${SO:-cache/so400m512}
 OUT=${OUT:-submission.csv}
+PSEUDO=${PSEUDO:-0.85}  # self-training on; set PSEUDO=0 to turn off
 
 "$PY" src/ensemble_probes.py \
   --backbone ViT-gopt-16-SigLIP2-384:webli:"$GOPT" \
   --backbone ViT-SO400M-16-SigLIP2-512:webli:"$SO" \
-  --names class_names.csv --C 10 \
+  --pseudo "$PSEUDO" \
   --write "$OUT"
 
 # figure for the report

@@ -381,7 +381,7 @@ def main():
     if args.write:
         with open(args.write, "w", newline="") as f:
             wr = csv.writer(f)
-            wr.writerow(["image_id", "predicted_class"])
+            wr.writerow(["ID", "Label"])
             for fn, row in zip(te_fnames, test_mix):
                 wr.writerow([fn, int(row.argmax())])
         print(f"\nwrote {args.write}")
