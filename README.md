@@ -1,4 +1,4 @@
-# CSE 144 Final: SigLIP-2 frozen-probe ensemble
+# CSE 144 Final - Kaggle Transfer Learning Competition
 
 **1st place on the public leaderboard** of the
 [UCSC CSE 144 Spring 2026 final project](https://www.kaggle.com/competitions/ucsc-cse-144-spring-2026-final-project).
