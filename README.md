@@ -1,7 +1,8 @@
 # CSE 144 Final - Kaggle Transfer Learning Competition
 
-**1st place on the public leaderboard** of the
-[UCSC CSE 144 Spring 2026 Final Project](https://www.kaggle.com/competitions/ucsc-cse-144-spring-2026-final-project).
+### **1st Place on Public Leaderboard**
+
+Kaggle Competition: [UCSC CSE 144 Spring 2026 Final Project](https://www.kaggle.com/competitions/ucsc-cse-144-spring-2026-final-project)
 
 ![Kaggle leaderboard placement](lb-pos.png)
 
