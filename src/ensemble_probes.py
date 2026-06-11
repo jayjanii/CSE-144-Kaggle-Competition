@@ -13,6 +13,7 @@ import torch
 import torch.nn.functional as F
 import torchvision.transforms.functional as TF
 from PIL import Image
+from tqdm import tqdm
 from sklearn.linear_model import LogisticRegression
 from sklearn.model_selection import StratifiedKFold
 
@@ -67,8 +68,9 @@ def four_views(img, size):
 
 
 @torch.inference_mode()
-def encode(image_fn, mean, std, paths, size, batch_size=32, dtype=torch.float16):
+def encode(image_fn, mean, std, paths, size, batch_size=32, dtype=torch.float16, desc="encode"):
     feats = []
+    pbar = tqdm(total=len(paths), desc=desc, unit="img", leave=True)
     for i in range(0, len(paths), batch_size):
         chunk = paths[i:i + batch_size]
         views = []
@@ -81,8 +83,8 @@ def encode(image_fn, mean, std, paths, size, batch_size=32, dtype=torch.float16)
         with torch.autocast(DEVICE, dtype=dtype, enabled=DEVICE == "cuda"):
             e = image_fn(x).reshape(len(chunk), 4, -1).mean(1)
         feats.append(F.normalize(e.float(), dim=-1).cpu())
-        if (i // batch_size + 1) % 10 == 0:
-            print(f"    {i + len(chunk)}/{len(paths)}")
+        pbar.update(len(chunk))
+    pbar.close()
     return torch.cat(feats, 0).numpy()
 
 
@@ -203,13 +205,16 @@ def text_probs(bb, names, X, temp=1.0):
 def probe_members(backbones, y, C, K, pseudo=None):
     # assemble probe (re-fit, optionally with pseudo) + cached text member per backbone
     oof, test, names = [], [], []
+    print("  members (oof acc):")
     for b in backbones:
         Xex = yex = None
         if pseudo is not None:
             mask, labels = pseudo
             Xex, yex = b["Xte"][mask], labels
         po = oof_probe(b["Xtr"], y, C, K, Xex, yex)
-        print(f"  {b['name']} probe OOF {(po.argmax(1) == y).mean():.4f}")
+        probe_acc = (po.argmax(1) == y).mean()
+        text_acc = (b["Zo"].argmax(1) == y).mean()
+        print(f"    {b['name']:28s} probe {probe_acc:.4f}  text {text_acc:.4f} (temp {b['temp']:.2f})")
         oof.append(po)
         test.append(full_probe(b["Xtr"], y, b["Xte"], C, K, Xex, yex))
         names.append(f"{b['name']}[probe]")
@@ -229,10 +234,10 @@ def probe_members(backbones, y, C, K, pseudo=None):
             mask, labels = pseudo
             Xex_concat, yex_concat = Xte_concat[mask], labels
         po_concat = oof_probe(Xtr_concat, y, C, K, Xex_concat, yex_concat)
-        print(f"  Concatenated probe OOF {(po_concat.argmax(1) == y).mean():.4f}")
+        print(f"    {'concat':28s} probe {(po_concat.argmax(1) == y).mean():.4f}")
         oof.append(po_concat)
         test.append(full_probe(Xtr_concat, y, Xte_concat, C, K, Xex_concat, yex_concat))
-        names.append("Concatenated[probe]")
+        names.append("concat[probe]")
 
     return oof, test, names
 
@@ -302,16 +307,14 @@ def main():
     prof = GPU_PROFILES[prof_name]
     batch_size = args.batch_size or prof["batch"]
     if prof["fast"] and DEVICE == "cuda":
-        # let cudnn pick fast kernels + enable tf32; encode is cached so the
-        # tiny loss of determinism doesnt touch the (cpu, seeded) probe.
-        torch.backends.cudnn.deterministic = False
-        torch.backends.cudnn.benchmark = True
+        # tf32 matmul is faster and still deterministic; leave cudnn deterministic.
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
 
+    dev_name = torch.cuda.get_device_name(0) if DEVICE == "cuda" else "cpu"
     import sklearn
-    print(f"seed {args.seed} | gpu {prof_name} (batch {batch_size}) | torch {torch.__version__} | "
-          f"sklearn {sklearn.__version__} | numpy {np.__version__} | device {DEVICE}")
+    print(f"seed {args.seed} | device {dev_name} | preset {prof_name} (batch {batch_size})")
+    print(f"torch {torch.__version__} | sklearn {sklearn.__version__} | numpy {np.__version__}")
 
     train_dir, test_dir = args.train_dir, args.test_dir
     if not train_dir or not test_dir:
@@ -325,6 +328,7 @@ def main():
     names = load_names(args.names, K)
 
     # encode each backbone once and keep its embeddings + zero-shot text members
+    print("\n[encode]")
     backbones = []
     for spec in args.backbone:
         model_name, pretrained, cache = spec.split(":", 2)
@@ -332,16 +336,16 @@ def main():
         cdir.mkdir(parents=True, exist_ok=True)
         trc, tec = cdir / "train.npy", cdir / "test.npy"
 
-        print(f"\n{model_name}: loading backbone...")
         bb = load_backbone(model_name, pretrained)
         if trc.exists() and tec.exists():
             Xtr, Xte = np.load(trc), np.load(tec)
-            print(f"  cached embeddings {Xtr.shape}")
+            print(f"  {model_name:28s} cached {Xtr.shape}")
         else:
-            print(f"  encoding train ({len(tr_paths)}) @ {bb['size']}...")
-            Xtr = encode(bb["image_fn"], bb["mean"], bb["std"], tr_paths, bb["size"], batch_size, prof["dtype"])
-            print(f"  encoding test ({len(te_paths)})...")
-            Xte = encode(bb["image_fn"], bb["mean"], bb["std"], te_paths, bb["size"], batch_size, prof["dtype"])
+            print(f"  {model_name} @ {bb['size']}")
+            Xtr = encode(bb["image_fn"], bb["mean"], bb["std"], tr_paths, bb["size"],
+                         batch_size, prof["dtype"], desc="    train")
+            Xte = encode(bb["image_fn"], bb["mean"], bb["std"], te_paths, bb["size"],
+                         batch_size, prof["dtype"], desc="    test ")
             np.save(trc, Xtr)
             np.save(tec, Xte)
 
@@ -356,37 +360,38 @@ def main():
 
         Zo = text_probs(bb, names, Xtr, temp=best_temp)
         Zt = text_probs(bb, names, Xte, temp=best_temp)
-        print(f"  text OOF acc {(Zo.argmax(1) == y).mean():.4f} (temp {best_temp:.2f}, loss {best_loss:.4f})")
-        backbones.append(dict(name=model_name, Xtr=Xtr, Xte=Xte, Zo=Zo, Zt=Zt))
+        backbones.append(dict(name=model_name, Xtr=Xtr, Xte=Xte, Zo=Zo, Zt=Zt, temp=best_temp))
         del bb
         torch.cuda.empty_cache()
 
     grid = [float(x) for x in args.grid.split(",")]
     skf = StratifiedKFold(n_splits=5, shuffle=True, random_state=SEED)
 
-    def evaluate(pseudo, tag):
+    def evaluate(pseudo):
         m_oof, m_test, m_names = probe_members(backbones, y, args.C, K, pseudo)
         a, w = fit_weights(m_oof, y, grid)
-        print(f"\n[{tag}] best weights:")
+        print("  weights:")
         for nm, wi in zip(m_names, w):
-            print(f"  {nm:40s} {wi:g}")
-        print(f"[{tag}] ensemble OOF: {a:.4f}   baseline: {args.baseline:.4f}")
+            print(f"    {nm:34s} {wi:g}")
+        print(f"  ensemble oof {a:.4f}  (baseline {args.baseline:.4f})")
         oof_mix = sum(wi * mo for wi, mo in zip(w, m_oof))
         fa = [float((oof_mix[va].argmax(1) == y[va]).mean()) for _, va in skf.split(oof_mix, y)]
-        print("  per-fold: " + "  ".join(f"{x:.4f}" for x in fa) +
-              f"  (mean {np.mean(fa):.4f}, std {np.std(fa):.4f})")
+        print(f"  per-fold {' '.join(f'{x:.4f}' for x in fa)}"
+              f"  (mean {np.mean(fa):.4f} std {np.std(fa):.4f})")
         test_mix = sum(wi * mt for wi, mt in zip(w, m_test))
         return a, test_mix / test_mix.sum(1, keepdims=True)
 
-    acc, test_mix = evaluate(None, "frozen")
+    print("\n[frozen]")
+    acc, test_mix = evaluate(None)
 
     if args.pseudo > 0:
         conf, pred = test_mix.max(1), test_mix.argmax(1)
         mask = conf >= args.pseudo
-        print(f"\npseudo-labeling: {int(mask.sum())}/{len(mask)} test imgs >= {args.pseudo}")
-        if mask.sum() > 0:
-            acc, test_mix = evaluate((mask, pred[mask].astype(int)), "pseudo")
-            print("  (note: pseudo-OOF is mildly optimistic; trust the public LB)")
+        n = int(mask.sum())
+        print(f"\n[pseudo >= {args.pseudo:g}]  {n}/{len(mask)} test imgs added")
+        if n > 0:
+            acc, test_mix = evaluate((mask, pred[mask].astype(int)))
+            print("  (oof optimistic)")
 
     if args.write:
         with open(args.write, "w", newline="") as f:
