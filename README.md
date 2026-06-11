@@ -7,8 +7,8 @@
 
 Two frozen SigLIP-2 backbones (gopt-384, SO400M-512). Each gives a logistic
 probe and a zero-shot text head; these candidates are averaged with weights
-tuned on a 5-fold OOF (weak members can drop to zero). See the report for
-details.
+tuned on a 5-fold OOF (weak members can drop to zero). See the full writeup in
+[CSE_144_Final.pdf](CSE_144_Final.pdf) for details.
 
 ## Run
 
