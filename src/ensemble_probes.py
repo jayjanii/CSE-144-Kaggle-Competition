@@ -20,7 +20,7 @@ from sklearn.model_selection import StratifiedKFold
 from data import get_data_dirs
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-SEED = 100
+SEED = 42
 
 # quiet the hf-hub weight/tokenizer download bars on cold start
 os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")

@@ -4,6 +4,7 @@
 import argparse
 import os
 import random
+import warnings
 
 import numpy as np
 import torch
@@ -12,7 +13,10 @@ from sklearn.model_selection import StratifiedKFold
 
 from data import get_data_dirs
 
-SEED = 100
+SEED = 42
+
+# a few classes have <5 images, so stratified k-fold cant fill every fold; fine
+warnings.filterwarnings("ignore", message="The least populated class")
 
 
 def load_labels(train_dir):
