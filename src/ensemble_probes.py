@@ -149,7 +149,7 @@ def full_probe(X, y, Xte, C_reg, K, Xex=None, yex=None):
     return P
 
 
-def text_probs(bb, names, templates, X):
+def text_probs(bb, names, templates, X, temp=1.0):
     with torch.inference_mode():
         feats = []
         for nm in names:
@@ -161,7 +161,9 @@ def text_probs(bb, names, templates, X):
         # unnamed class -> just use the average text vector
         known = F.normalize(torch.stack([t for t in feats if t is not None]).mean(0), dim=0)
         feats = torch.stack([t if t is not None else known for t in feats])
-        return ((torch.tensor(X).to(DEVICE) @ feats.T) * bb["scale"]).softmax(1).cpu().numpy()
+        # scale the logits by both model scale and temperature
+        logits = (torch.tensor(X).to(DEVICE) @ feats.T) * (bb["scale"] / temp)
+        return logits.softmax(1).cpu().numpy()
 
 
 def probe_members(backbones, y, C, K, pseudo=None):
@@ -180,6 +182,27 @@ def probe_members(backbones, y, C, K, pseudo=None):
         oof.append(b["Zo"])
         test.append(b["Zt"])
         names.append(f"{b['name']}[text]")
+
+    # Concatenated probe (Early Fusion)
+    if len(backbones) > 1:
+        Xtr_concat = np.concatenate([b["Xtr"] for b in backbones], axis=-1)
+        Xte_concat = np.concatenate([b["Xte"] for b in backbones], axis=-1)
+        # Re-normalize L2 so that concatenated features behave nicely
+        Xtr_concat = Xtr_concat / np.linalg.norm(Xtr_concat, axis=-1, keepdims=True)
+        Xte_concat = Xte_concat / np.linalg.norm(Xte_concat, axis=-1, keepdims=True)
+        
+        Xex_concat = yex_concat = None
+        if pseudo is not None:
+            mask, labels = pseudo
+            Xex_concat = Xte_concat[mask]
+            yex_concat = labels
+            
+        po_concat = oof_probe(Xtr_concat, y, C, K, Xex_concat, yex_concat)
+        print(f"  Concatenated probe OOF {(po_concat.argmax(1) == y).mean():.4f}")
+        oof.append(po_concat)
+        test.append(full_probe(Xtr_concat, y, Xte_concat, C, K, Xex_concat, yex_concat))
+        names.append("Concatenated[probe]")
+        
     return oof, test, names
 
 
@@ -280,9 +303,21 @@ def main():
             np.save(trc, Xtr)
             np.save(tec, Xte)
 
-        Zo = text_probs(bb, names, templates, Xtr)
-        Zt = text_probs(bb, names, templates, Xte)
-        print(f"  text  OOF acc {(Zo.argmax(1) == y).mean():.4f}")
+        # Optimize temperature scale on OOF train predictions using cross-entropy log-loss
+        best_temp = 1.0
+        best_loss = float("inf")
+        # Grid search over temperature values
+        for temp in [0.5, 0.75, 1.0, 1.25, 1.5, 2.0, 2.5, 3.0, 4.0, 5.0]:
+            Zo_temp = text_probs(bb, names, templates, Xtr, temp=temp)
+            eps = 1e-15
+            loss = -np.mean(np.log(np.clip(Zo_temp[np.arange(len(y)), y], eps, 1.0 - eps)))
+            if loss < best_loss:
+                best_loss = loss
+                best_temp = temp
+        
+        Zo = text_probs(bb, names, templates, Xtr, temp=best_temp)
+        Zt = text_probs(bb, names, templates, Xte, temp=best_temp)
+        print(f"  text OOF acc {(Zo.argmax(1) == y).mean():.4f} (temp {best_temp:.2f}, loss {best_loss:.4f})")
         backbones.append(dict(name=model_name, Xtr=Xtr, Xte=Xte, Zo=Zo, Zt=Zt))
         del bb
         torch.cuda.empty_cache()
