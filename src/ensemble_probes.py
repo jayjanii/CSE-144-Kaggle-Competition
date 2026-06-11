@@ -31,6 +31,9 @@ warnings.filterwarnings("ignore", message="The least populated class")
 # hardware presets: bigger batch + bf16/tf32 fast matmul on the strong cards.
 # encoding is the only gpu-bound step, so this is where it pays off.
 # note: encode stacks 4 tta views, so real forward batch is 4x these numbers.
+# measured end-to-end, cold encode of both backbones:
+#   a100 80gb: batch 256, ~67gb peak, ~9 min
+#   l4   24gb: batch 64,  ~18gb peak, ~25 min
 GPU_PROFILES = {
     "a100": dict(batch=128, fast=True, dtype=torch.bfloat16),  # 80gb bumps to 256; also h100
     "l4":   dict(batch=64,  fast=False, dtype=torch.float16),
@@ -41,10 +44,24 @@ GPU_PROFILES = {
 def pick_profile(name):
     if name != "auto":
         return name
-    dev = torch.cuda.get_device_name(0).lower() if DEVICE == "cuda" else ""
+    if DEVICE != "cuda":
+        return "t4"
+    dev = torch.cuda.get_device_name(0).lower()
+    if "l4" in dev:
+        return "l4"
+    if "t4" in dev:
+        return "t4"
     if "a100" in dev or "h100" in dev:
         return "a100"
-    return "l4" if "l4" in dev else "t4"
+    # unknown card (h200, blackwell, a40, etc.): fall back by vram so a strong
+    # card isnt stuck on the conservative t4 preset. 40gb+ datacenter cards are
+    # ampere or newer, so bf16/tf32 in the a100 preset is safe.
+    vram = torch.cuda.get_device_properties(0).total_memory / 1e9
+    if vram >= 40:
+        return "a100"
+    if vram >= 20:
+        return "l4"
+    return "t4"
 
 
 def set_seed(seed=SEED):

@@ -1,0 +1,312 @@
+\documentclass[11pt]{article}
+
+% --- packages ---
+\usepackage[margin=1in]{geometry}
+\usepackage{mathptmx}            % times-like serif, paper look
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{amsmath}
+\usepackage{caption}
+\usepackage{subcaption}
+\usepackage{xcolor}
+\usepackage[colorlinks=true,linkcolor=black,citecolor=black,urlcolor=blue]{hyperref}
+
+\captionsetup{font=small,labelfont=bf}
+\setlength{\parskip}{0.35em}
+
+% --- title ---
+\title{\vspace{-1.5em}\textbf{Frozen Vision--Language Features for\\ Fine-Grained 100-Class Transfer Learning}\vspace{-0.3em}}
+\author{
+  Jay Jani (CruzID: \texttt{XXXXX})\\
+  % add up to two more members here
+  \small CSE 144: Applied Machine Learning --- Final Project, UC Santa Cruz
+}
+\date{Spring 2026}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+\noindent
+I tackle a 100-class fine-grained image classification task spanning four visual
+domains (food, flowers, cars, and aircraft) with only about ten labeled images per
+class. With so little data, fully fine-tuning a large network overfits. Instead I
+use transfer learning through \emph{frozen} feature extraction: I keep two
+pretrained SigLIP-2 vision--language backbones fixed and train only lightweight
+linear classifiers on top of their embeddings, combined with zero-shot text
+classifiers built from the class names. A small ensemble of these heads, with
+weights tuned by cross-validation, reaches \textbf{96.3\%} five-fold accuracy and
+\textbf{98.1\%} on the Kaggle public leaderboard. I show that this frozen approach
+beats my best fine-tuning runs while being far cheaper and fully reproducible.
+\end{abstract}
+
+% ======================================================================
+\section{Introduction}
+
+The goal is to classify images into 100 categories sampled from several different
+source datasets, so the classes are \emph{fine-grained}: many cars, several flower
+species, dishes, and aircraft models that differ only in small details. The
+training set has roughly ten images per class, which is far too few to train a deep
+network from scratch.
+
+Transfer learning is the natural fit. A model pretrained on a very large image
+corpus already encodes general visual features; I only need to adapt those
+features to the 100 labels. The usual recipe is to fine-tune the pretrained
+weights, but with $\sim$10 images per class fine-tuning quickly memorizes the
+training set. I therefore take the opposite end of the transfer-learning
+spectrum: I \emph{freeze} the backbone entirely and learn only a small classifier
+on top of its fixed embeddings.
+
+My approach combines (i) linear probes on frozen SigLIP-2 embeddings, (ii)
+zero-shot text classifiers that compare each image to the encoded class names, and
+(iii) a cross-validated weighted ensemble of these heads. The final system reaches
+96.3\% accuracy under five-fold cross-validation and 98.1\% on the public
+leaderboard, comfortably above the 60\% baseline, while training in seconds on CPU
+once the embeddings are cached.
+
+% ======================================================================
+\section{Dataset}
+
+\paragraph{Size and structure.} The data contain 100 classes drawn from four
+domains. The training set has 1{,}079 images organized as \texttt{train/<label>/*.jpg},
+and the test set has 1{,}036 unlabeled images in \texttt{test/*.jpg}. Folder names
+are the integer labels, so class ``\texttt{0}'' maps to label $0$, class
+``\texttt{1}'' to label $1$, and so on; I keep this mapping exactly to match the
+grader.
+
+\paragraph{Domains.} The 100 classes are contiguous blocks of 25: labels 0--24 are
+food, 25--49 are flowers, 50--74 are cars, and 75--99 are aircraft. I use this
+structure later to build domain-aware text prompts.
+
+\paragraph{Preprocessing.} Images come in varied sizes, so each is resized to the
+backbone's native resolution (384$\times$384 for one model, 512$\times$512 for the
+other) and normalized with that model's mean and standard deviation. At inference
+I use simple test-time augmentation (TTA): four views per image (a center crop, a
+square resize, and their horizontal flips), whose embeddings are averaged. I do no
+random training-time augmentation, because the backbone is frozen and the probe is
+trained on fixed feature vectors.
+
+% ======================================================================
+\section{Method}
+
+\subsection{Frozen backbones}
+I use two pretrained SigLIP-2 vision--language models from the
+\texttt{open\_clip} library: a ViT-g/16 at 384px (1536-d embeddings) and a
+SO400M/16 at 512px (1152-d embeddings). Both are trained with a contrastive
+image--text objective on web-scale data. I chose contrastive
+vision--language models on purpose: the classes are nameable, web-common concepts,
+which is exactly what these models align well. Crucially, the backbones are never
+updated; I only run them forward to extract embeddings, which I cache to disk.
+
+\subsection{Linear probes}
+For each backbone I train a multinomial logistic-regression probe on the
+L2-normalized embeddings (\texttt{scikit-learn}, inverse regularization $C=10$,
+balanced class weights). I also train a third probe on the \emph{concatenation} of
+both backbones' embeddings (early fusion), which captures complementary information
+the two models encode differently.
+
+\subsection{Zero-shot text heads}
+Each backbone also has a text encoder. For every class I encode its name with a
+few short, domain-specific prompt templates (for example
+``\emph{a photo of the car model \{\}}'' for cars, or
+``\emph{a close-up photo of a \{\} flower}'' for flowers) and average the resulting
+text vectors. An image is then scored by cosine similarity to each class vector.
+I calibrate the softmax temperature of each text head by minimizing
+cross-entropy on the training folds, which sharpens the probabilities and improves
+accuracy at no extra cost.
+
+\subsection{Cross-validated ensemble}
+The above gives five candidate heads: two linear probes, two text heads, and the
+concatenated probe. I combine their predicted probabilities with non-negative
+weights and pick the argmax. The weights are tuned to maximize five-fold
+out-of-fold (OOF) accuracy using random-restart coordinate ascent, which avoids
+the local optima a plain greedy search falls into. Weak heads are free to receive
+weight zero, so the search effectively performs model selection.
+
+% ======================================================================
+\section{Experiments}
+
+\paragraph{Validation protocol.} All design choices are made on a leak-free
+5-fold stratified cross-validation of the training set. Each test prediction comes
+from a probe trained only on the training data; no test label is ever used.
+
+\paragraph{Which backbone?} I compared several strong pretrained backbones by the
+accuracy of a single linear probe on their frozen features
+(Table~\ref{tab:backbones}). The two SigLIP-2 models are clearly the strongest. I
+also tried adding the others to the ensemble; in every case the cross-validated
+weight search drove them to zero, meaning they added no information beyond the two
+SigLIP-2 models. Self-supervised features (DINOv2) lag the contrastive
+vision--language models, consistent with the classes being nameable concepts.
+
+\begin{table}[t]
+\centering
+\caption{Single linear-probe accuracy (5-fold OOF) for different frozen backbones.
+Only the two SigLIP-2 models receive non-zero weight in the final ensemble.}
+\label{tab:backbones}
+\begin{tabular}{llc}
+\toprule
+Backbone & Pretraining & Probe OOF \\
+\midrule
+SigLIP-2 ViT-g/16 (384) & contrastive (WebLI) & \textbf{0.944} \\
+SigLIP-2 SO400M/16 (512) & contrastive (WebLI) & \textbf{0.942} \\
+DFN ViT-H/14 (378) & contrastive & 0.932 \\
+ConvNeXt-XXL & contrastive (LAION-2B) & 0.913 \\
+EVA02-L/14 (336) & contrastive & 0.906 \\
+MetaCLIP-2 ViT-H/14 & contrastive & 0.894 \\
+DINOv2 ViT-g/14 & self-supervised & 0.846 \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{Frozen probing vs.\ fine-tuning.} I also tried fully fine-tuning a
+backbone with layer-wise learning-rate decay, label smoothing, and stochastic
+depth. Despite this regularization, the small training set caused overfitting and
+my best fine-tuning result reached only about 95.4\%, below the frozen ensemble
+and far more expensive and sensitive to seeds. This is the central reason my final
+system is frozen: with $\sim$10 images per class, adapting only a linear head on
+strong fixed features generalizes better than moving the backbone weights.
+
+\paragraph{Probe hyperparameters.} The probe accuracy is flat across $C \in [3,
+100]$; an $\ell_2$ penalty with the \texttt{lbfgs} solver beats $\ell_1$, and
+balanced class weights match the default at the plateau. I therefore fix $C=10$.
+A nonlinear probe (MLP) did not help, because the contrastive features are already
+close to linearly separable.
+
+% ======================================================================
+\section{Results}
+
+\paragraph{Member and ensemble accuracy.} Table~\ref{tab:members} lists the
+accuracy of each ensemble member and of the final weighted combination. The
+ensemble reaches 96.3\% OOF accuracy, about two points above the best single head,
+and the per-fold standard deviation is small ($\pm 0.008$).
+
+\begin{table}[t]
+\centering
+\caption{Final ensemble members and combined accuracy (5-fold OOF).}
+\label{tab:members}
+\begin{tabular}{lc}
+\toprule
+Head & OOF accuracy \\
+\midrule
+SigLIP-2 ViT-g probe        & 0.944 \\
+SigLIP-2 ViT-g text         & 0.951 \\
+SigLIP-2 SO400M probe       & 0.942 \\
+SigLIP-2 SO400M text        & 0.943 \\
+Concatenated probe          & 0.948 \\
+\midrule
+\textbf{Weighted ensemble}  & \textbf{0.963} \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\paragraph{Probe convergence.} Figure~\ref{fig:curve} shows training and
+validation loss and accuracy for a linear head trained on the frozen ViT-g
+embeddings, across all five folds. The probe converges quickly and the small
+gap between train and validation curves confirms it is not overfitting, which is
+expected when only a linear layer is learned.
+
+\begin{figure}[t]
+\centering
+\includegraphics[width=0.92\linewidth]{probe_curve.png}
+\caption{Five-fold loss and accuracy curves for a linear probe on frozen SigLIP-2
+ViT-g embeddings. Faint lines are individual folds; bold lines are the mean. Final
+validation accuracy is $0.946 \pm 0.004$.}
+\label{fig:curve}
+\end{figure}
+
+\paragraph{Leaderboard.} My final submission scores \textbf{98.1\%} on the Kaggle
+public leaderboard. Because the public split is only about 10\% of the test set
+($\sim$114 images), a single image is worth nearly one percent, so this number is
+noisy; I treat the 96.3\% cross-validation estimate as the more reliable measure
+of true performance. Both are well above the 60\% baseline.
+
+% ======================================================================
+\section{Discussion}
+
+\paragraph{What worked.} The biggest win was choosing transfer by frozen feature
+extraction rather than fine-tuning. Strong contrastive backbones already separate
+these classes almost linearly, so a tiny classifier on fixed features both
+generalizes better and is trivially reproducible. Temperature-calibrated,
+domain-aware text prompts and the concatenated early-fusion probe each gave small
+additional gains.
+
+\paragraph{The ensemble is decorrelation-limited.} Once both SigLIP-2 models are
+in the ensemble, adding more accurate or more backbones barely moves the combined
+score. The reason is that ensembling helps only when members make
+\emph{different} mistakes; the remaining errors are largely shared across all
+heads. This explains why every extra backbone I tried was weighted to zero.
+
+\paragraph{Failure cases.} A clear example is two car classes that correspond to
+nearly identical vehicle variants: the images are visually indistinguishable, so
+no model can separate them reliably from pixels alone. Errors like these are
+effectively irreducible and account for part of the remaining $\sim$3.7\%.
+
+\paragraph{Limitations and next steps.} The method depends on having class names
+that match web concepts, which is what makes the zero-shot text heads useful; it
+would help less on abstract categories. I also explored self-training
+(pseudo-labeling confident test images), but its effect flipped sign across random
+seeds, i.e.\ it was within noise, so I did not rely on it. A promising direction
+is light, heavily regularized fine-tuning of only the last few blocks, which might
+combine the stability of frozen features with a little task-specific adaptation.
+
+% ======================================================================
+\section{Reproducibility}
+
+\paragraph{Determinism.} I fix a single random seed (42) that seeds Python,
+NumPy, and PyTorch, and enable deterministic cuDNN. The probe and cross-validation
+are CPU-based and seeded, so results are bit-reproducible on a given machine. I
+report 5-fold cross-validated accuracy with its standard deviation rather than a
+single split.
+
+\paragraph{Environment.} PyTorch 2.11 (CUDA 12.8), \texttt{open\_clip},
+\texttt{scikit-learn} 1.6.1, NumPy 2.0.2. A hardware preset auto-selects batch size
+and precision for the detected GPU (T4 / L4 / A100). Backbone embeddings are
+computed once and cached, after which the full pipeline runs in CPU-seconds. A cold
+run (encoding both backbones from scratch) takes about 9 minutes on an A100 80\,GB
+($\sim$67\,GB peak) and about 25 minutes on an L4 24\,GB ($\sim$18\,GB peak); once
+the embeddings are cached, re-running the probe and ensemble takes only seconds.
+
+\paragraph{Commands.} The full pipeline (encode, probe, ensemble, write
+\texttt{submission.csv}) runs with:
+\begin{quote}\small\ttfamily
+bash run.sh
+\end{quote}
+or directly:
+\begin{quote}\small\ttfamily
+python src/ensemble\_probes.py \textbackslash\\
+\hspace*{1em}--backbone ViT-gopt-16-SigLIP2-384:webli:cache/gopt \textbackslash\\
+\hspace*{1em}--backbone ViT-SO400M-16-SigLIP2-512:webli:cache/so400m512 \textbackslash\\
+\hspace*{1em}--write submission.csv
+\end{quote}
+The probe curve figure is produced by
+\texttt{python src/probe\_curve.py --emb cache/gopt/train.npy --out probe\_curve.png}.
+
+% ======================================================================
+\section{Team Contributions}
+
+\begin{itemize}
+  \item \textbf{Jay Jani:} method design, backbone and ensemble experiments,
+        code, report. % edit/split as needed
+  % \item Member 2: ...
+  % \item Member 3: ...
+\end{itemize}
+
+% ======================================================================
+\begin{thebibliography}{9}
+\small
+\bibitem{siglip} X. Zhai, B. Mustafa, A. Kolesnikov, L. Beyer.
+  \emph{Sigmoid Loss for Language Image Pre-Training (SigLIP)}. ICCV, 2023.
+\bibitem{siglip2} M. Tschannen et al.
+  \emph{SigLIP 2: Multilingual Vision--Language Encoders}. arXiv, 2025.
+\bibitem{clip} A. Radford et al.
+  \emph{Learning Transferable Visual Models from Natural Language Supervision
+  (CLIP)}. ICML, 2021.
+\bibitem{openclip} G. Ilharco et al. \emph{OpenCLIP}.
+  \url{https://github.com/mlfoundations/open_clip}, 2021.
+\bibitem{sklearn} F. Pedregosa et al.
+  \emph{Scikit-learn: Machine Learning in Python}. JMLR, 2011.
+\bibitem{dinov2} M. Oquab et al.
+  \emph{DINOv2: Learning Robust Visual Features without Supervision}. TMLR, 2024.
+\end{thebibliography}
+
+\end{document}
