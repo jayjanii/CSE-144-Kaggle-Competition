@@ -28,6 +28,9 @@ cache/
 *.npy
 submission*.csv
 
+# non-deliverable sources (report .tex, scratch, etc.)
+misc/
+
 .*
 !.gitignore
 !.gitattributes
