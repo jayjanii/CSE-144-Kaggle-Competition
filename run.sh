@@ -23,10 +23,12 @@ GOPT=${GOPT:-cache/gopt}
 SO=${SO:-cache/so400m512}
 OUT=${OUT:-submission.csv}
 PSEUDO=${PSEUDO:-0.85}  # self-training on; set PSEUDO=0 to turn off
+GPU=${GPU:-auto}        # auto-detects a100/l4/t4; set GPU=a100 to force
 
 "$PY" src/ensemble_probes.py \
   --backbone ViT-gopt-16-SigLIP2-384:webli:"$GOPT" \
   --backbone ViT-SO400M-16-SigLIP2-512:webli:"$SO" \
+  --gpu "$GPU" \
   --pseudo "$PSEUDO" \
   --write "$OUT"
 

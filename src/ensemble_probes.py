@@ -24,6 +24,23 @@ SEED = 42
 # a few classes have <5 images, so stratified k-fold cant fill every fold; fine
 warnings.filterwarnings("ignore", message="The least populated class")
 
+# hardware presets: bigger batch + bf16/tf32 fast matmul on the strong cards.
+# encoding is the only gpu-bound step, so this is where it pays off.
+GPU_PROFILES = {
+    "a100": dict(batch=256, fast=True, dtype=torch.bfloat16),  # also h100
+    "l4":   dict(batch=64,  fast=False, dtype=torch.float16),
+    "t4":   dict(batch=32,  fast=False, dtype=torch.float16),
+}
+
+
+def pick_profile(name):
+    if name != "auto":
+        return name
+    dev = torch.cuda.get_device_name(0).lower() if DEVICE == "cuda" else ""
+    if "a100" in dev or "h100" in dev:
+        return "a100"
+    return "l4" if "l4" in dev else "t4"
+
 
 def set_seed(seed=SEED):
     random.seed(seed)
@@ -50,7 +67,7 @@ def four_views(img, size):
 
 
 @torch.inference_mode()
-def encode(image_fn, mean, std, paths, size, batch_size=32):
+def encode(image_fn, mean, std, paths, size, batch_size=32, dtype=torch.float16):
     feats = []
     for i in range(0, len(paths), batch_size):
         chunk = paths[i:i + batch_size]
@@ -60,8 +77,8 @@ def encode(image_fn, mean, std, paths, size, batch_size=32):
             for v in four_views(img, size):
                 views.append((TF.to_tensor(v) - mean) / std)
         x = torch.stack(views).to(DEVICE)
-        # frozen backbone, so half precision on gpu is free speed
-        with torch.autocast(DEVICE, dtype=torch.float16, enabled=DEVICE == "cuda"):
+        # frozen backbone, so low precision on gpu is free speed
+        with torch.autocast(DEVICE, dtype=dtype, enabled=DEVICE == "cuda"):
             e = image_fn(x).reshape(len(chunk), 4, -1).mean(1)
         feats.append(F.normalize(e.float(), dim=-1).cpu())
         if (i // batch_size + 1) % 10 == 0:
@@ -267,7 +284,9 @@ def main():
     p.add_argument("--train-dir", default=None)
     p.add_argument("--test-dir", default=None)
     p.add_argument("--num-classes", type=int, default=100)
-    p.add_argument("--batch-size", type=int, default=32)
+    p.add_argument("--gpu", choices=["auto", "a100", "l4", "t4"], default="auto",
+                   help="hardware preset: batch size + fast-matmul knobs")
+    p.add_argument("--batch-size", type=int, default=None, help="override preset batch")
     p.add_argument("--C", type=float, default=10.0)
     p.add_argument("--baseline", type=float, default=0.9592)
     p.add_argument("--grid", default="0,0.25,0.5,0.75,1.0,1.5,2.0")
@@ -278,8 +297,20 @@ def main():
     args = p.parse_args()
 
     set_seed(args.seed)
+
+    prof_name = pick_profile(args.gpu)
+    prof = GPU_PROFILES[prof_name]
+    batch_size = args.batch_size or prof["batch"]
+    if prof["fast"] and DEVICE == "cuda":
+        # let cudnn pick fast kernels + enable tf32; encode is cached so the
+        # tiny loss of determinism doesnt touch the (cpu, seeded) probe.
+        torch.backends.cudnn.deterministic = False
+        torch.backends.cudnn.benchmark = True
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+
     import sklearn
-    print(f"seed {args.seed} | torch {torch.__version__} | "
+    print(f"seed {args.seed} | gpu {prof_name} (batch {batch_size}) | torch {torch.__version__} | "
           f"sklearn {sklearn.__version__} | numpy {np.__version__} | device {DEVICE}")
 
     train_dir, test_dir = args.train_dir, args.test_dir
@@ -308,9 +339,9 @@ def main():
             print(f"  cached embeddings {Xtr.shape}")
         else:
             print(f"  encoding train ({len(tr_paths)}) @ {bb['size']}...")
-            Xtr = encode(bb["image_fn"], bb["mean"], bb["std"], tr_paths, bb["size"], args.batch_size)
+            Xtr = encode(bb["image_fn"], bb["mean"], bb["std"], tr_paths, bb["size"], batch_size, prof["dtype"])
             print(f"  encoding test ({len(te_paths)})...")
-            Xte = encode(bb["image_fn"], bb["mean"], bb["std"], te_paths, bb["size"], args.batch_size)
+            Xte = encode(bb["image_fn"], bb["mean"], bb["std"], te_paths, bb["size"], batch_size, prof["dtype"])
             np.save(trc, Xtr)
             np.save(tec, Xte)
 
