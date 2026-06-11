@@ -20,15 +20,19 @@ from sklearn.model_selection import StratifiedKFold
 from data import get_data_dirs
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-SEED = 42
+SEED = 100
+
+# quiet the hf-hub weight/tokenizer download bars on cold start
+os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
 
 # a few classes have <5 images, so stratified k-fold cant fill every fold; fine
 warnings.filterwarnings("ignore", message="The least populated class")
 
 # hardware presets: bigger batch + bf16/tf32 fast matmul on the strong cards.
 # encoding is the only gpu-bound step, so this is where it pays off.
+# note: encode stacks 4 tta views, so real forward batch is 4x these numbers.
 GPU_PROFILES = {
-    "a100": dict(batch=256, fast=True, dtype=torch.bfloat16),  # also h100
+    "a100": dict(batch=128, fast=True, dtype=torch.bfloat16),  # 80gb bumps to 256; also h100
     "l4":   dict(batch=64,  fast=False, dtype=torch.float16),
     "t4":   dict(batch=32,  fast=False, dtype=torch.float16),
 }
@@ -306,6 +310,10 @@ def main():
     prof_name = pick_profile(args.gpu)
     prof = GPU_PROFILES[prof_name]
     batch_size = args.batch_size or prof["batch"]
+    # a100 ships in 40 and 80gb; only use the big batch when the vram is there
+    if args.batch_size is None and prof_name == "a100" and DEVICE == "cuda":
+        vram = torch.cuda.get_device_properties(0).total_memory / 1e9
+        batch_size = 256 if vram >= 70 else 128
     if prof["fast"] and DEVICE == "cuda":
         # tf32 matmul is faster and still deterministic; leave cudnn deterministic.
         torch.backends.cuda.matmul.allow_tf32 = True

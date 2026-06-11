@@ -12,7 +12,7 @@ from sklearn.model_selection import StratifiedKFold
 
 from data import get_data_dirs
 
-SEED = 42
+SEED = 100
 
 
 def load_labels(train_dir):
