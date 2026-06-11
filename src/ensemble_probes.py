@@ -152,11 +152,40 @@ def full_probe(X, y, Xte, C_reg, K, Xex=None, yex=None):
 def text_probs(bb, names, templates, X, temp=1.0):
     with torch.inference_mode():
         feats = []
-        for nm in names:
+        for i, nm in enumerate(names):
             if not nm:
                 feats.append(None)
                 continue
-            t = bb["text_fn"]([tpl.format(nm) for tpl in templates]).mean(0)
+            
+            # Category-specific prompt templates to resolve class name ambiguities
+            if 0 <= i <= 24:      # Food
+                tpls = [
+                    "a photo of {}, a type of food.",
+                    "a plate of delicious {}.",
+                    "a close-up photo of the food {}."
+                ]
+            elif 25 <= i <= 49:   # Flowers
+                tpls = [
+                    "a close-up photo of a {} flower.",
+                    "a photo of {}, a type of flower.",
+                    "the beautiful {} flower."
+                ]
+            elif 50 <= i <= 74:   # Cars
+                tpls = [
+                    "a photo of the car model {}.",
+                    "a photo of the vehicle {}.",
+                    "a {} driving on the street."
+                ]
+            elif 75 <= i <= 99:   # Aircraft
+                tpls = [
+                    "a photo of the {} aircraft.",
+                    "the airplane {} in flight.",
+                    "a photo of the {} plane."
+                ]
+            else:                 # Fallback to default
+                tpls = templates
+
+            t = bb["text_fn"]([tpl.format(nm) for tpl in tpls]).mean(0)
             feats.append(F.normalize(t, dim=0))
         # unnamed class -> just use the average text vector
         known = F.normalize(torch.stack([t for t in feats if t is not None]).mean(0), dim=0)
