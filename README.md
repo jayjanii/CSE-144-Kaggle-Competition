@@ -1,9 +1,9 @@
 # CSE 144 Final - Kaggle Transfer Learning Competition
 
 **1st place on the public leaderboard** of the
-[UCSC CSE 144 Spring 2026 final project](https://www.kaggle.com/competitions/ucsc-cse-144-spring-2026-final-project).
+[UCSC CSE 144 Spring 2026 Final Project](https://www.kaggle.com/competitions/ucsc-cse-144-spring-2026-final-project).
 
-![Kaggle leaderboard placement](kaggle-lb-placement.png)
+![Kaggle leaderboard placement](lb-pos.png)
 
 Two frozen SigLIP-2 backbones (gopt-384, SO400M-512). Each gives a logistic
 probe and a zero-shot text head; these candidates are averaged with weights
